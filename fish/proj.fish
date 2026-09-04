@@ -176,6 +176,19 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
                 lazygit --path "$parts[2]"
                 set pause 0
 
+            case notes
+                # Same cd-in reasoning as `edit`: the README links to other files
+                # in the project, and an editor started elsewhere resolves them
+                # against elsewhere.
+                pushd "$parts[2]"
+                or begin
+                    echo "proj: cannot enter $parts[2]" >&2
+                    continue
+                end
+                $EDITOR README.md
+                popd
+                set pause 0
+
             case rebase
                 __proj_rebase_and_build "$parts[2]"
 

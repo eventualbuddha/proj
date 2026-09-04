@@ -70,6 +70,18 @@ fn main() -> Result<()> {
             }
         }
 
+        // Wait for the first network refresh too, not just the scan. With a warm
+        // cache the render is right either way; with a cold one it would show a
+        // dashboard with no PR state at all and no way to tell that apart from
+        // there being none.
+        {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while app.fetched_at.is_none() && std::time::Instant::now() < deadline {
+                app.drain();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
         // The event loop asks for the selected row's check contexts every
         // frame; do the same here, or --render shows a menu missing its CI entry
         // and looks like a bug in the menu rather than in the harness.
@@ -349,7 +361,24 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.filter = Some(String::new());
         }
         KeyCode::Char('?') => app.help = true,
-        KeyCode::Char('o') => open_url(app),
+        KeyCode::Char('[') => app.cycle_sidebar(false),
+        KeyCode::Char(']') => app.cycle_sidebar(true),
+        // The project's README is where the state of a project actually lives --
+        // what is blocked, what the traps are, what to do next. `n` is taken by
+        // "new workstream", so `o` it is.
+        KeyCode::Char('o') => {
+            let dir = app
+                .project()
+                .and_then(|p| p.readme.parent().map(|d| d.display().to_string()));
+            match dir {
+                Some(d) => {
+                    if emit(app, format!("notes\t{d}")) {
+                        return true;
+                    }
+                }
+                None => app.flash("no project selected"),
+            }
+        }
 
         // Navigate and launch.
         KeyCode::Char('g') => {
@@ -499,8 +528,34 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: ratatui::layout::Rect) -> bo
     }
 }
 
+/// Open the selected PR's url, or copy it. Reports which in the footer, because
+/// "copied" and "opened" look identical from the outside and only one of them
+/// means a browser is about to appear.
+///
+/// No longer bound to a key -- `o` is the project's notes now -- but still what
+/// clicking the underlined url in the detail pane does.
+fn open_url(app: &mut App) {
+    let Some(url) = app.selected_url() else {
+        app.flash("no PR on this row");
+        return;
+    };
+    match link::open_or_copy(&url) {
+        link::Outcome::Opened => app.flash("opened in a browser"),
+        link::Outcome::Copied => app.flash("PR url copied to the clipboard"),
+        link::Outcome::Failed(e) => app.flash(format!("could not open: {e}")),
+    }
+}
+
 /// Build the copy menu for the selected row.
 fn open_copy_menu(app: &mut App) {
+    if app.sidebar == app::Sidebar::Reviews {
+        let Some(r) = app.review().cloned() else {
+            app.flash("nothing to copy");
+            return;
+        };
+        app.copy_menu = Some(CopyMenu::for_review(&r));
+        return;
+    }
     let Some(w) = app.workstream().cloned() else {
         app.flash("nothing selected");
         return;
@@ -523,21 +578,6 @@ fn copy_selected(app: &mut App) {
     match link::copy(&value) {
         Ok(()) => app.flash(format!("{label} copied")),
         Err(e) => app.flash(format!("clipboard: {e}")),
-    }
-}
-
-/// Open the selected PR's url, or copy it. Reports which in the footer, because
-/// "copied" and "opened" look identical from the outside and only one of them
-/// means a browser is about to appear.
-fn open_url(app: &mut App) {
-    let Some(url) = app.selected_url() else {
-        app.flash("no PR on this row");
-        return;
-    };
-    match link::open_or_copy(&url) {
-        link::Outcome::Opened => app.flash("opened in a browser"),
-        link::Outcome::Copied => app.flash("PR url copied to the clipboard"),
-        link::Outcome::Failed(e) => app.flash(format!("could not open: {e}")),
     }
 }
 

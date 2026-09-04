@@ -95,6 +95,24 @@ query($owner: String!, $name: String!, $number: Int!) {
 pub struct Cache {
     pub fetched_at: u64,
     pub prs: Vec<CachedPr>,
+    /// Defaulted so a cache written before reviews existed still loads rather
+    /// than being discarded whole.
+    #[serde(default)]
+    pub reviews: Vec<CachedReview>,
+}
+
+#[derive(serde::Serialize, Deserialize, Clone)]
+pub struct CachedReview {
+    pub number: u32,
+    pub title: String,
+    pub url: String,
+    pub author: String,
+    pub branch: String,
+    pub state: String,
+    pub reason: String,
+    pub check_state: String,
+    pub check_total: u32,
+    pub updated: i64,
 }
 #[derive(serde::Serialize, Deserialize, Clone)]
 pub struct CachedPr {
@@ -220,12 +238,177 @@ pub fn refresh(owner: &str, name: &str, branches: &[String]) -> Result<Cache> {
         }
     }
 
+    // The review queue rides along on the same cycle. A failure here is not a
+    // failure of the whole refresh -- an empty queue and an unreachable one look
+    // the same on screen, but losing the workstream PRs too would be worse.
+    let reviews = match viewer(owner) {
+        Ok((me, teams)) => review_queue(owner, name, &me, &teams).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+
     let cache = Cache {
         fetched_at: now(),
         prs,
+        reviews,
     };
     save_cache(owner, name, &cache)?;
     Ok(cache)
+}
+
+/// Your review queue: three questions, one request.
+///
+///   review-requested       someone named you
+///   team-review-requested  someone named a team you are in
+///   reviewed-by + moved    you already reviewed it and commits landed after
+///
+/// The third is the one neither of the others returns and the easiest to drop on
+/// the floor -- you looked, you approved or asked for changes, and then it
+/// changed. It is only counted when the head commit is newer than your latest
+/// review, which is why that query asks for both dates.
+const REVIEW_QUERY: &str = r#"
+query($q1: String!, $q2: String!, $q3: String!, $me: String!) {
+  a1: search(query: $q1, type: ISSUE, first: 30) { nodes { ...pr } }
+  a2: search(query: $q2, type: ISSUE, first: 30) { nodes { ...pr } }
+  a3: search(query: $q3, type: ISSUE, first: 30) { nodes {
+    ...pr
+    ... on PullRequest { reviews(last: 1, author: $me) { nodes { submittedAt } } }
+  } }
+}
+fragment pr on PullRequest {
+  number title url isDraft state headRefName
+  author { login }
+  commits(last: 1) { nodes { commit {
+    committedDate
+    statusCheckRollup { state contexts { totalCount } }
+  } } }
+}
+"#;
+
+/// ISO 8601 to unix seconds, by shelling out to `date`. Only the ordering
+/// matters here, and a date crate for one comparison is not worth the build.
+fn iso_to_unix(s: &str) -> i64 {
+    std::process::Command::new("date")
+        .args(["-u", "-d", s, "+%s"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Fetch the review queue. `teams` are org/team slugs you belong to.
+pub fn review_queue(
+    owner: &str,
+    name: &str,
+    me: &str,
+    teams: &[String],
+) -> Result<Vec<CachedReview>> {
+    let repo = format!("repo:{owner}/{name} is:pr is:open");
+    let team_clause = if teams.is_empty() {
+        // A query that cannot match, rather than one with no filter at all: an
+        // empty clause would return every open PR in the repo as a review.
+        format!("{repo} team-review-requested:{owner}/__none__")
+    } else {
+        format!(
+            "{repo} {}",
+            teams
+                .iter()
+                .map(|t| format!("team-review-requested:{t}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
+
+    let args: Vec<String> = vec![
+        "api".into(),
+        "graphql".into(),
+        "-f".into(),
+        format!("query={REVIEW_QUERY}"),
+        "-F".into(),
+        format!("q1={repo} review-requested:{me}"),
+        "-F".into(),
+        format!("q2={team_clause}"),
+        "-F".into(),
+        format!("q3={repo} reviewed-by:{me}"),
+        "-F".into(),
+        format!("me={me}"),
+    ];
+
+    let body = gh(&args)?;
+    let v: serde_json::Value = serde_json::from_slice(&body)?;
+
+    let mut out: Vec<CachedReview> = Vec::new();
+    for (alias, reason) in [("a1", "requested"), ("a2", "team"), ("a3", "re-review")] {
+        for n in v["data"][alias]["nodes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            let number = n["number"].as_u64().unwrap_or(0) as u32;
+            if number == 0 || out.iter().any(|r| r.number == number) {
+                continue;
+            }
+            let commit = &n["commits"]["nodes"][0]["commit"];
+            let updated = commit["committedDate"].as_str().map(iso_to_unix).unwrap_or(0);
+
+            if reason == "re-review" {
+                // Only when it moved since you looked.
+                let reviewed = n["reviews"]["nodes"][0]["submittedAt"]
+                    .as_str()
+                    .map(iso_to_unix)
+                    .unwrap_or(0);
+                if reviewed == 0 || updated <= reviewed {
+                    continue;
+                }
+            }
+
+            let rollup = &commit["statusCheckRollup"];
+            let is_draft = n["isDraft"].as_bool().unwrap_or(false);
+            out.push(CachedReview {
+                number,
+                title: n["title"].as_str().unwrap_or("").to_string(),
+                url: n["url"].as_str().unwrap_or("").to_string(),
+                author: n["author"]["login"].as_str().unwrap_or("").to_string(),
+                branch: n["headRefName"].as_str().unwrap_or("").to_string(),
+                state: if is_draft { "DRAFT".into() } else { "OPEN".into() },
+                reason: reason.to_string(),
+                check_state: rollup["state"].as_str().unwrap_or("NONE").to_string(),
+                check_total: rollup["contexts"]["totalCount"].as_u64().unwrap_or(0) as u32,
+                updated,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Your login, and the teams you belong to within `owner`.
+pub fn viewer(owner: &str) -> Result<(String, Vec<String>)> {
+    let me = String::from_utf8_lossy(&gh(&[
+        "api".into(),
+        "user".into(),
+        "--jq".into(),
+        ".login".into(),
+    ])?)
+    .trim()
+    .to_string();
+
+    let jq = format!("{}", r#".[] | "\(.organization.login)/\(.slug)""#);
+    let teams = gh(&[
+        "api".into(),
+        "user/teams".into(),
+        "--paginate".into(),
+        "--jq".into(),
+        jq,
+    ])
+    .map(|o| {
+        String::from_utf8_lossy(&o)
+            .lines()
+            .filter(|l| l.starts_with(&format!("{owner}/")))
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default();
+
+    Ok((me, teams))
 }
 
 /// Every check context for a PR, with its url. One request, for one PR, on
@@ -278,6 +461,37 @@ pub fn contexts(owner: &str, name: &str, number: u32) -> Result<Vec<Check>> {
         });
     }
     Ok(out)
+}
+
+/// Turn cached review rows into the model's shape.
+pub fn to_reviews(cache: &Cache) -> Vec<Review> {
+    cache
+        .reviews
+        .iter()
+        .map(|r| Review {
+            number: r.number,
+            title: r.title.clone(),
+            url: r.url.clone(),
+            author: r.author.clone(),
+            branch: r.branch.clone(),
+            state: if r.state == "DRAFT" {
+                PrState::Draft
+            } else {
+                PrState::Open
+            },
+            checks: Checks {
+                state: CheckState::parse(&r.check_state),
+                total: r.check_total,
+                contexts: None,
+            },
+            reason: match r.reason.as_str() {
+                "team" => ReviewReason::TeamRequested,
+                "re-review" => ReviewReason::Rereview,
+                _ => ReviewReason::Requested,
+            },
+            updated: r.updated,
+        })
+        .collect()
 }
 
 /// Fold a cache into the workstreams whose branch matches.

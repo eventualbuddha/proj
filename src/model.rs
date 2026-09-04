@@ -334,3 +334,36 @@ pub enum ProjectKind {
     Project,
     Review,
 }
+
+/// Why a PR is in your review queue. Worth keeping apart: the first two are
+/// "someone is waiting on you", the third is "you already looked, and it moved".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewReason {
+    Requested,
+    TeamRequested,
+    Rereview,
+}
+
+impl ReviewReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            ReviewReason::Requested => "requested",
+            ReviewReason::TeamRequested => "team",
+            ReviewReason::Rereview => "re-review",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Review {
+    pub number: u32,
+    pub title: String,
+    pub url: String,
+    pub author: String,
+    pub branch: String,
+    pub state: PrState,
+    pub checks: Checks,
+    pub reason: ReviewReason,
+    /// Unix seconds of the head commit, for "how stale is what I am looking at".
+    pub updated: i64,
+}

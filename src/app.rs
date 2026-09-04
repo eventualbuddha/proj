@@ -145,6 +145,27 @@ impl CopyMenu {
         CopyMenu { items, idx: 0 }
     }
 
+    /// The same idea for someone else's PR: what you paste while reviewing is
+    /// the url, the CI link, and the branch you would check out.
+    pub fn for_review(r: &Review) -> Self {
+        let mut items = vec![
+            CopyItem::new("PR url", r.url.clone()),
+            CopyItem::new("PR number", format!("#{}", r.number)),
+            CopyItem::new("branch", r.branch.clone()),
+        ];
+        if let Some(c) = r.checks.ci_url() {
+            if !c.url.is_empty() {
+                let label = if c.failed { "CI ✗" } else { "CI" };
+                items.push(CopyItem::new(label, c.url.clone()).with_note(short_job(&c.name)));
+            }
+        }
+        items.push(CopyItem::new(
+            "checkout",
+            format!("gh pr checkout {}", r.number),
+        ));
+        CopyMenu { items, idx: 0 }
+    }
+
     pub fn selected(&self) -> Option<&CopyItem> {
         self.items.get(self.idx)
     }
@@ -157,6 +178,15 @@ pub struct Confirm {
     pub verb: String,
 }
 
+/// Which list the sidebar is showing. lazygit cycles its panels with [ and ],
+/// and this is the same gesture: two views of "what is waiting on me", one of
+/// them your own work and the other other people's.
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum Sidebar {
+    Projects,
+    Reviews,
+}
+
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Pane {
     Projects,
@@ -166,6 +196,9 @@ pub enum Pane {
 pub struct App {
     pub projects: Vec<Project>,
     pub pane: Pane,
+    pub sidebar: Sidebar,
+    pub reviews: Vec<Review>,
+    pub review_idx: usize,
     pub project_idx: usize,
     pub workstream_idx: usize,
     pub fetched_at: Option<u64>,
@@ -223,6 +256,9 @@ impl App {
         let mut app = App {
             projects: Vec::new(),
             pane: Pane::Projects,
+            sidebar: Sidebar::Projects,
+            reviews: Vec::new(),
+            review_idx: 0,
             project_idx: 0,
             workstream_idx: 0,
             fetched_at: None,
@@ -343,6 +379,23 @@ impl App {
     /// answer -- an error that sent nothing left the row saying "loading…" and
     /// re-spawning a request every 100ms for as long as it stayed selected.
     pub fn request_contexts(&mut self) {
+        if self.sidebar == Sidebar::Reviews {
+            let Some(r) = self.review() else { return };
+            if r.checks.contexts.is_some() || r.checks.is_empty() {
+                return;
+            }
+            let number = r.number;
+            if !self.contexts_inflight.insert(number) {
+                return;
+            }
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                let list = github::contexts(OWNER, REPO, number).unwrap_or_default();
+                let _ = tx.send(Msg::Contexts(number, list));
+            });
+            return;
+        }
+
         let Some(w) = self.workstream() else { return };
         let Some(pr) = &w.pr else { return };
         // Fetched for any PR with checks, not only failing ones: the copy menu
@@ -400,6 +453,7 @@ impl App {
                     self.refreshing = false;
                     self.fetched_at = Some(cache.fetched_at);
                     github::apply(&mut self.projects, &cache);
+                    self.reviews = github::to_reviews(&cache);
                     // `git cherry` over every row costs a few hundred
                     // milliseconds, so it does not run on the UI thread either.
                     // It answers with pairs rather than a tree -- see Msg::Merged.
@@ -437,6 +491,13 @@ impl App {
                 }
                 Msg::Contexts(number, list) => {
                     self.contexts_inflight.remove(&number);
+                    // A number can name a workstream's PR or a review; both
+                    // lists are keyed by it, so both get the answer.
+                    for r in &mut self.reviews {
+                        if r.number == number {
+                            r.checks.contexts = Some(list.clone());
+                        }
+                    }
                     for p in &mut self.projects {
                         for w in &mut p.workstreams {
                             if let Some(pr) = &mut w.pr {
@@ -496,7 +557,28 @@ impl App {
         }
     }
 
+    pub fn review(&self) -> Option<&Review> {
+        self.reviews.get(self.review_idx)
+    }
+
+    /// Cycle the sidebar. Only two lists so far, so both keys are the same move
+    /// in opposite directions, which is what [ and ] mean in lazygit too.
+    pub fn cycle_sidebar(&mut self, _forward: bool) {
+        self.sidebar = match self.sidebar {
+            Sidebar::Projects => Sidebar::Reviews,
+            Sidebar::Reviews => Sidebar::Projects,
+        };
+        // Reviews have no second pane to be in.
+        self.pane = Pane::Projects;
+    }
+
     pub fn move_down(&mut self) {
+        if self.sidebar == Sidebar::Reviews {
+            if !self.reviews.is_empty() {
+                self.review_idx = (self.review_idx + 1) % self.reviews.len();
+            }
+            return;
+        }
         match self.pane {
             Pane::Projects => {
                 let n = self.visible().len();
@@ -515,6 +597,12 @@ impl App {
     }
 
     pub fn move_up(&mut self) {
+        if self.sidebar == Sidebar::Reviews {
+            if !self.reviews.is_empty() {
+                self.review_idx = (self.review_idx + self.reviews.len() - 1) % self.reviews.len();
+            }
+            return;
+        }
         match self.pane {
             Pane::Projects => {
                 let n = self.visible().len();

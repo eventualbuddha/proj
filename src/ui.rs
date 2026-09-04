@@ -4,7 +4,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use crate::app::{ago, project_health, spinner, App, Pane};
+use crate::app::{ago, project_health, spinner, App, Pane, Sidebar};
 use crate::discover::UNFILED;
 use crate::model::*;
 
@@ -94,9 +94,15 @@ pub fn regions(area: Rect) -> Regions {
 pub fn draw(f: &mut Frame, app: &mut App) {
     let r = regions(f.area());
 
-    draw_projects(f, app, r.projects);
-    draw_workstreams(f, app, r.workstreams);
-    draw_detail(f, app, r.detail);
+    if app.sidebar == Sidebar::Reviews {
+        draw_reviews(f, app, r.projects);
+        draw_review_checks(f, app, r.workstreams);
+        draw_review_detail(f, app, r.detail);
+    } else {
+        draw_projects(f, app, r.projects);
+        draw_workstreams(f, app, r.workstreams);
+        draw_detail(f, app, r.detail);
+    }
     draw_footer(f, app, r.footer);
 
     // The scan is off the main thread so the window appears at once; until it
@@ -260,6 +266,166 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
             })),
         area,
         &mut app.list_state,
+    );
+}
+
+fn draw_reviews(f: &mut Frame, app: &mut App, area: Rect) {
+    let title = format!("Reviews ({})", app.reviews.len());
+
+    if app.reviews.is_empty() {
+        // An empty queue is the normal state here -- reviews turn over the same
+        // day -- so it needs to read as "nothing waiting", not as "broken".
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  nothing waiting on you",
+                    Style::default().fg(DIM),
+                )),
+            ])
+            .block(border(&title, app.pane == Pane::Projects)),
+            area,
+        );
+        return;
+    }
+
+    let rows: Vec<ListItem> = app
+        .reviews
+        .iter()
+        .map(|r| {
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(
+                        format!("#{} ", r.number),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(r.checks.state.glyph(), check_style(r.checks.state)),
+                    Span::styled(
+                        format!(" {}", r.reason.label()),
+                        Style::default().fg(match r.reason {
+                            ReviewReason::Rereview => Color::Yellow,
+                            _ => DIM,
+                        }),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    format!("  {}", truncate(&r.title, 24)),
+                    Style::default(),
+                )),
+                Line::from(Span::styled(
+                    format!("  {}", r.author),
+                    Style::default().fg(DIM),
+                )),
+            ])
+        })
+        .collect();
+
+    app.list_state.select(Some(app.review_idx));
+    f.render_stateful_widget(
+        List::new(rows)
+            .block(border(&title, app.pane == Pane::Projects))
+            .highlight_style(Style::default().bg(ACCENT)),
+        area,
+        &mut app.list_state,
+    );
+}
+
+/// The selected review's checks. Which jobs are red is the first thing you want
+/// to know about someone else's PR, and it is the pane the workstreams table
+/// would otherwise be using.
+fn draw_review_checks(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(r) = app.review() else {
+        f.render_widget(border("Checks", false), area);
+        return;
+    };
+    let title = format!("Checks: #{}", r.number);
+
+    let lines: Vec<Line> = match &r.checks.contexts {
+        Some(cs) if !cs.is_empty() => cs
+            .iter()
+            .map(|c| {
+                Line::from(vec![
+                    Span::styled(
+                        if c.failed { "✗ " } else { "✓ " },
+                        if c.failed {
+                            Style::default().fg(Color::Red)
+                        } else {
+                            Style::default().fg(Color::Green)
+                        },
+                    ),
+                    Span::raw(c.name.rsplit(": ").next().unwrap_or(&c.name).to_string()),
+                ])
+            })
+            .collect(),
+        Some(_) => vec![Line::from(Span::styled(
+            "no checks reported",
+            Style::default().fg(DIM),
+        ))],
+        None => vec![Line::from(vec![
+            Span::styled(spinner(), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("  loading {} checks", r.checks.total),
+                Style::default().fg(DIM),
+            ),
+        ])],
+    };
+
+    f.render_widget(Paragraph::new(lines).block(border(&title, false)), area);
+}
+
+fn draw_review_detail(f: &mut Frame, app: &App, area: Rect) {
+    let Some(r) = app.review() else {
+        f.render_widget(border("Detail", false), area);
+        return;
+    };
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled("   ", Style::default().fg(DIM)),
+        Span::raw(truncate(&r.title, 84)),
+    ])];
+    lines.push(Line::from(vec![
+        Span::styled("   ", Style::default().fg(DIM)),
+        Span::styled(r.url.clone(), Style::default().fg(Color::Blue).underlined()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(format!("{BRANCH_ICON}  "), Style::default().fg(DIM)),
+        Span::raw(r.branch.clone()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("   ", Style::default().fg(DIM)),
+        Span::raw(r.author.clone()),
+        Span::styled(
+            format!("   {} ", r.reason.label()),
+            Style::default().fg(match r.reason {
+                ReviewReason::Rereview => Color::Yellow,
+                _ => DIM,
+            }),
+        ),
+    ]));
+    if r.updated > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("󰇗  ", Style::default().fg(DIM)),
+            Span::styled(
+                format!("head commit {}", ago(r.updated as u64)),
+                Style::default().fg(DIM),
+            ),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("󰙨  ", Style::default().fg(DIM)),
+        Span::styled(
+            format!("{} {}", r.checks.state.glyph(), r.checks.state.label()),
+            check_style(r.checks.state),
+        ),
+        Span::styled(
+            format!("  {} checks", r.checks.total),
+            Style::default().fg(DIM),
+        ),
+    ]));
+
+    f.render_widget(
+        Paragraph::new(lines).block(border(&format!("#{}", r.number), false)),
+        area,
     );
 }
 
@@ -570,11 +736,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // No j/k or tab here. Movement keys are the ones you learn in the first ten
+    // seconds and then never read again, and the footer is narrow enough that
+    // every one of them costs a key you might actually have forgotten. They stay
+    // in `?`.
     let mut spans = vec![
-        Span::styled("j/k", Style::default().fg(ACCENT)),
-        Span::styled(" move  ", Style::default().fg(DIM)),
-        Span::styled("tab", Style::default().fg(ACCENT)),
-        Span::styled(" pane  ", Style::default().fg(DIM)),
         Span::styled("↵", Style::default().fg(ACCENT)),
         Span::styled(" cd/create  ", Style::default().fg(DIM)),
         Span::styled("/", Style::default().fg(ACCENT)),
@@ -588,9 +754,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("y", Style::default().fg(ACCENT)),
         Span::styled(" copy  ", Style::default().fg(DIM)),
         Span::styled("o", Style::default().fg(ACCENT)),
-        Span::styled(" url  ", Style::default().fg(DIM)),
+        Span::styled(" notes  ", Style::default().fg(DIM)),
         Span::styled("?", Style::default().fg(ACCENT)),
         Span::styled(" help  ", Style::default().fg(DIM)),
+        Span::styled("[ ]", Style::default().fg(ACCENT)),
+        Span::styled(" reviews  ", Style::default().fg(DIM)),
         Span::styled("q", Style::default().fg(ACCENT)),
         Span::styled(" quit", Style::default().fg(DIM)),
     ];
@@ -666,6 +834,7 @@ fn draw_help(f: &mut Frame) {
         Line::from(""),
         Line::from("  j / k, ↓ / ↑    move within the focused pane"),
         Line::from("  tab / h / l     switch pane"),
+        Line::from("  [ / ]           switch the sidebar between projects and reviews"),
         Line::from("  ↵               quit and cd to the selected workstream"),
         Line::from("  /               filter projects by name, workstream or branch"),
         Line::from("  esc             step back: workstreams → projects, or clear a filter"),
