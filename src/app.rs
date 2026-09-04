@@ -45,6 +45,13 @@ pub enum Msg {
     Contexts(u32, Vec<String>),
 }
 
+pub struct Confirm {
+    pub title: String,
+    pub body: Vec<String>,
+    /// The `--cd-file` verb to write if confirmed.
+    pub verb: String,
+}
+
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Pane {
     Projects,
@@ -77,6 +84,8 @@ pub struct App {
     pub table_state: TableState,
     pub error: Option<String>,
     pub help: bool,
+    /// A destructive action waiting on a yes. Holds the verb to emit.
+    pub confirm: Option<Confirm>,
     pub filter: Option<String>,
     pub filtering: bool,
     pub tx: Sender<Msg>,
@@ -120,6 +129,7 @@ impl App {
             table_state: TableState::default(),
             error: None,
             help: false,
+            confirm: None,
             filter: None,
             filtering: false,
             tx,

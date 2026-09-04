@@ -105,19 +105,40 @@ end
 # The dashboard
 # ---------------------------------------------------------------------------
 
-function __proj_run_tui --description "Run the TUI and act on what it asks for"
-    set -l file (mktemp)
-    proj-tui --cd-file "$file" $argv
-    set -l st $status
+function __proj_run_tui --description "Run the dashboard, act on what it asks for, and come back"
+    # A loop, not a single run. Most actions -- lazygit, an editor, a rebase, a
+    # push -- are things you do *while* looking at the dashboard, so the natural
+    # end of one is being back at it. Only `cd` and quitting leave.
+    while true
+        set -l file (mktemp)
+        proj-tui --cd-file "$file" $argv
+        set -l st $status
 
-    # The TUI writes one tab-separated instruction. A verb rather than a bare
-    # path because ↵ on a virtual row -- a branch with no worktree -- has to
-    # create one, and creating one means `pnpm install && pnpm build`. That
-    # belongs out here where its output is visible and Ctrl-C works, not inside
-    # a full-screen program.
-    if test -s "$file"
+        if not test -s "$file"
+            # No verb: the user quit.
+            rm -f "$file"
+            return $st
+        end
+
         set -l parts (string split \t -- (cat "$file"))
         rm -f "$file"
+
+        # Where the next run should open, so acting on a row does not send the
+        # selection back to the top of the list. The second field is a worktree
+        # path for some verbs and <project>/<workstream> for others, so strip the
+        # root before taking the first component -- splitting an absolute path on
+        # "/" yields an empty first element and reopens on nothing.
+        set -l reopen
+        if test (count $parts) -ge 2
+            set -l ref "$parts[2]"
+            set -l root (__proj_root)
+            if string match -q "$root/*" -- "$ref"
+                set ref (string replace -- "$root/" "" "$ref")
+            end
+            if test -n "$ref"
+                set reopen --select (string split -m1 / -- "$ref")[1]
+            end
+        end
 
         switch $parts[1]
             case cd
@@ -127,16 +148,60 @@ function __proj_run_tui --description "Run the TUI and act on what it asks for"
             case new
                 echo "Creating worktree for '$parts[2]' on branch '$parts[3]'..."
                 __proj_new "$parts[2]" --branch-name "$parts[3]"
-                return $status
+
+            case edit
+                $EDITOR "$parts[2]"
+
+            case lazygit
+                lazygit --path "$parts[2]"
+
+            case rebase
+                __proj_rebase_and_build "$parts[2]"
+
+            case push
+                __proj_push "$parts[2]" "$parts[3]"
+
+            case delete
+                __proj_remove "$parts[2]"
+                # The row is gone, so reopening on it would land nowhere.
+                set reopen
 
             case '*'
                 echo "proj: the dashboard asked for something unknown: $parts[1]" >&2
                 return 1
         end
+
+        # A pause before the full-screen redraw, so whatever just scrolled past
+        # -- a rebase conflict, a push URL, a failed build -- can actually be
+        # read rather than being wiped by the next frame.
+        echo ""
+        read -P "Press enter to return to proj (or ctrl-c to stay here) " -l _
+        or return 0
+
+        set argv $reopen
+    end
+end
+
+function __proj_push --description "Push WORKTREE's branch to its remote name, setting upstream"
+    set -l wt_path "$argv[1]"
+    set -l remote_branch "$argv[2]"
+
+    set -l branch (git -C "$wt_path" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    if test -z "$branch"; or test "$branch" = HEAD
+        echo "proj push: refusing to push a detached HEAD" >&2
+        return 1
     end
 
-    rm -f "$file"
-    return $st
+    # An explicit refspec, because local and remote names differ by design:
+    # `<project>/<workstream>` here, `brian/<project>/<workstream>` there. A bare
+    # `git push` with push.autoSetupRemote would create a same-named remote
+    # branch and quietly bypass the whole convention.
+    echo "Pushing '$branch' to origin/$remote_branch..."
+    git -C "$wt_path" push origin "$branch:refs/heads/$remote_branch"
+    or return 1
+
+    git -C "$wt_path" branch -u "origin/$remote_branch" "$branch" >/dev/null 2>&1
+    echo "Upstream set to origin/$remote_branch"
 end
 
 # ---------------------------------------------------------------------------

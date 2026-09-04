@@ -18,7 +18,7 @@ use crossterm::terminal::{
 use std::io::stdout;
 use std::time::Duration;
 
-use app::{App, Pane};
+use app::{App, Confirm, Pane};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -202,6 +202,21 @@ fn run(term: &mut Terminal, app: &mut App) -> Result<()> {
             continue;
         }
 
+        // A confirmation swallows every key but y/n: a destructive action must
+        // never be one keystroke away from a mistyped navigation key.
+        if let Some(c) = &app.confirm {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let verb = c.verb.clone();
+                    app.confirm = None;
+                    app.action = Some(verb);
+                    break;
+                }
+                _ => app.confirm = None,
+            }
+            continue;
+        }
+
         if app.help {
             app.help = false;
             continue;
@@ -220,6 +235,54 @@ fn run(term: &mut Terminal, app: &mut App) -> Result<()> {
             }
             KeyCode::Char('?') => app.help = true,
             KeyCode::Char('o') => open_url(app),
+
+            // Navigate and launch.
+            KeyCode::Char('g') => {
+                if let Some(p) = require_path(app) {
+                    if emit(app, format!("lazygit\t{p}")) {
+                        break;
+                    }
+                }
+            }
+            KeyCode::Char('e') => {
+                if let Some(p) = require_path(app) {
+                    if emit(app, format!("edit\t{p}")) {
+                        break;
+                    }
+                }
+            }
+            KeyCode::Char('y') => {
+                let path = app.workstream().and_then(|w| w.path.clone());
+                match path {
+                    Some(p) => {
+                        let text = p.display().to_string();
+                        match link::copy(&text) {
+                            Ok(()) => app.flash("path copied to the clipboard"),
+                            Err(e) => app.flash(format!("clipboard: {e}")),
+                        }
+                    }
+                    None => app.flash("no worktree yet — ↵ creates one"),
+                }
+            }
+
+            // Git.
+            KeyCode::Char('b') => {
+                if let Some(p) = require_path(app) {
+                    if emit(app, format!("rebase\t{p}")) {
+                        break;
+                    }
+                }
+            }
+            KeyCode::Char('p') => {
+                let remote = app.workstream().map(|w| w.git.remote_branch.clone());
+                if let (Some(p), Some(remote)) = (require_path(app), remote) {
+                    if emit(app, format!("push\t{p}\t{remote}")) {
+                        break;
+                    }
+                }
+            }
+
+            KeyCode::Char('d') => confirm_delete(app),
             KeyCode::Char('r') => app.start_refresh(),
             KeyCode::Char('R') => app.start_scan(false),
             KeyCode::Char('a') => {
@@ -348,6 +411,30 @@ fn open_url(app: &mut App) {
     }
 }
 
+/// Emit a verb for the shell wrapper and quit the loop.
+///
+/// Everything that runs longer than an instant, or that can fail in a way you
+/// need to read, goes out to the shell rather than being run in here: a rebase
+/// that conflicts, a push that is rejected, a build that fails. The wrapper
+/// reopens the dashboard afterwards, so this is a round trip rather than an
+/// exit.
+fn emit(app: &mut App, verb: String) -> bool {
+    app.action = Some(verb);
+    true
+}
+
+/// The selected workstream's path, or a note in the footer saying why there
+/// isn't one. Every action below needs a worktree; a virtual row has none.
+fn require_path(app: &mut App) -> Option<String> {
+    match app.workstream().and_then(|w| w.path.clone()) {
+        Some(p) => Some(p.display().to_string()),
+        None => {
+            app.flash("no worktree yet — ↵ creates one");
+            None
+        }
+    }
+}
+
 /// Turn the selection into the instruction the shell wrapper acts on.
 fn activate(app: &mut App) -> bool {
     let Some(w) = app.workstream() else {
@@ -358,6 +445,45 @@ fn activate(app: &mut App) -> bool {
         None => format!("new\t{}\t{}", w.qualified(), w.git.branch),
     });
     true
+}
+
+/// Ask before removing a workstream, and say what is at stake.
+///
+/// `proj rm` refuses on uncommitted or unpushed work anyway, so this is not the
+/// safety net -- it is the part that tells you *which* workstream you are about
+/// to remove, before the shell scrolls past with an answer.
+fn confirm_delete(app: &mut App) {
+    let Some(w) = app.workstream() else { return };
+    if w.is_virtual() {
+        app.flash("nothing to delete — this branch has no worktree");
+        return;
+    }
+
+    let qualified = w.qualified();
+    let mut body = vec![format!("branch  {}", w.git.branch)];
+    if w.merged.is_merged() {
+        body.push(format!("this is {} into main", w.merged.label()));
+    } else {
+        body.push("NOT merged into main".to_string());
+    }
+    if w.git.dirty > 0 {
+        body.push(format!("{} uncommitted change(s) — proj rm will refuse", w.git.dirty));
+    }
+    if w.git.unpushed.is_some_and(|n| n > 0) {
+        body.push(format!(
+            "{} unpushed commit(s) — proj rm will refuse",
+            w.git.unpushed.unwrap()
+        ));
+    }
+    if w.git.upstream.is_none() {
+        body.push("never pushed — proj rm will refuse".to_string());
+    }
+
+    app.confirm = Some(Confirm {
+        title: format!(" delete {qualified} "),
+        body,
+        verb: format!("delete\t{qualified}"),
+    });
 }
 
 fn dump(no_gh: bool) -> Result<()> {

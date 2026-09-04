@@ -114,6 +114,25 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             44,
             7,
         );
+    } else if let Some(c) = &app.confirm {
+        let mut text = vec![Line::from("")];
+        for line in &c.body {
+            let style = if line.contains("refuse") || line.starts_with("NOT") {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(DIM)
+            };
+            text.push(Line::from(Span::styled(line.clone(), style)));
+        }
+        text.push(Line::from(""));
+        text.push(Line::from(vec![
+            Span::styled("y", Style::default().fg(Color::Red).bold()),
+            Span::styled(" delete    ", Style::default().fg(DIM)),
+            Span::styled("any other key", Style::default().bold()),
+            Span::styled(" cancel", Style::default().fg(DIM)),
+        ]));
+        let h = text.len() as u16 + 2;
+        draw_modal(f, &c.title.clone(), text, 64, h);
     } else if app.help {
         draw_help(f);
     }
@@ -442,10 +461,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" cd/create  ", Style::default().fg(DIM)),
         Span::styled("/", Style::default().fg(ACCENT)),
         Span::styled(" filter  ", Style::default().fg(DIM)),
+        Span::styled("g", Style::default().fg(ACCENT)),
+        Span::styled(" lazygit  ", Style::default().fg(DIM)),
+        Span::styled("b", Style::default().fg(ACCENT)),
+        Span::styled(" rebase  ", Style::default().fg(DIM)),
+        Span::styled("p", Style::default().fg(ACCENT)),
+        Span::styled(" push  ", Style::default().fg(DIM)),
         Span::styled("o", Style::default().fg(ACCENT)),
         Span::styled(" url  ", Style::default().fg(DIM)),
-        Span::styled("r", Style::default().fg(ACCENT)),
-        Span::styled(" refresh  ", Style::default().fg(DIM)),
         Span::styled("?", Style::default().fg(ACCENT)),
         Span::styled(" help  ", Style::default().fg(DIM)),
         Span::styled("q", Style::default().fg(ACCENT)),
@@ -511,7 +534,15 @@ fn draw_help(f: &mut Frame) {
         Line::from("  ↵               quit and cd to the selected workstream"),
         Line::from("  /               filter projects by name, workstream or branch"),
         Line::from("  esc             clear the filter"),
-        Line::from("  o               open the PR url, or copy it (OSC 52) if headless"),
+        Line::from(""),
+        Line::from(Span::styled("  acting on the selected workstream", Style::default().bold())),
+        Line::from("  g               lazygit, scoped to its worktree"),
+        Line::from("  e               $EDITOR there"),
+        Line::from("  y               copy its path      o   its PR url"),
+        Line::from("  b               rebase on main, then rebuild"),
+        Line::from("  p               push, to brian/<project>/<workstream>"),
+        Line::from("  d               delete it, after confirming"),
+        Line::from(""),
         Line::from("  r               refresh from GitHub"),
         Line::from("  R               re-scan the filesystem and git now"),
         Line::from("  a               pause or resume automatic refreshes"),
@@ -533,7 +564,10 @@ fn draw_help(f: &mut Frame) {
         Line::from(Span::styled("  Actions land in phase 3.", Style::default().fg(DIM))),
     ];
 
-    let area = centered(74, 18, f.area());
+    // Sized from the content rather than a guess: the list grew from 12 lines to
+    // 29 while the box stayed at 18, which silently clipped a third of it.
+    let h = (text.len() as u16 + 2).min(f.area().height);
+    let area = centered(76, h, f.area());
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(text).block(
