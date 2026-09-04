@@ -158,7 +158,18 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
                 __proj_new "$parts[2]" --branch-name "$parts[3]"
 
             case edit
-                $EDITOR "$parts[2]"
+                # cd in, rather than passing the path as an argument. An editor
+                # started elsewhere inherits that elsewhere: :terminal, :!, LSP
+                # root detection and every fuzzy-finder resolve against the
+                # directory `proj` was launched from, not the worktree you asked
+                # to edit. lazygit does not need this -- its --path chdirs.
+                pushd "$parts[2]"
+                or begin
+                    echo "proj: cannot enter $parts[2]" >&2
+                    continue
+                end
+                $EDITOR .
+                popd
                 set pause 0
 
             case lazygit
