@@ -1,0 +1,22 @@
+[package]
+name = "proj"
+version = "0.1.0"
+edition = "2021"
+
+# Installed as `proj-tui`, not `proj`: `proj` is the fish function that wraps it,
+# because a process cannot change its parent shell's directory and the whole
+# point of the ↵ key is that it does.
+[[bin]]
+name = "proj-tui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.28"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
