@@ -207,130 +207,149 @@ fn run(term: &mut Terminal, app: &mut App) -> Result<()> {
             continue;
         }
 
-        if app.filtering {
-            match key.code {
-                KeyCode::Esc => {
-                    app.filtering = false;
-                    app.filter = None;
-                }
-                KeyCode::Enter => app.filtering = false,
-                KeyCode::Backspace => {
-                    if let Some(f) = &mut app.filter {
-                        f.pop();
-                    }
-                }
-                KeyCode::Char(c) => app.filter.get_or_insert_with(String::new).push(c),
-                _ => {}
-            }
-            app.project_idx = 0;
-            app.workstream_idx = 0;
-            continue;
-        }
-
-        // A confirmation swallows every key but y/n: a destructive action must
-        // never be one keystroke away from a mistyped navigation key.
-        if let Some(c) = &app.confirm {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    let verb = c.verb.clone();
-                    app.confirm = None;
-                    app.action = Some(verb);
-                    break;
-                }
-                _ => app.confirm = None,
-            }
-            continue;
-        }
-
-        if app.help {
-            app.help = false;
-            continue;
-        }
-
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => break,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-            KeyCode::Char('j') | KeyCode::Down => app.move_down(),
-            KeyCode::Char('k') | KeyCode::Up => app.move_up(),
-            KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right => app.pane = Pane::Workstreams,
-            KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Left => app.pane = Pane::Projects,
-            KeyCode::Char('/') => {
-                app.filtering = true;
-                app.filter = Some(String::new());
-            }
-            KeyCode::Char('?') => app.help = true,
-            KeyCode::Char('o') => open_url(app),
-
-            // Navigate and launch.
-            KeyCode::Char('g') => {
-                if let Some(p) = require_path(app) {
-                    if emit(app, format!("lazygit\t{p}")) {
-                        break;
-                    }
-                }
-            }
-            KeyCode::Char('e') => {
-                if let Some(p) = require_path(app) {
-                    if emit(app, format!("edit\t{p}")) {
-                        break;
-                    }
-                }
-            }
-            KeyCode::Char('y') => {
-                let path = app.workstream().and_then(|w| w.path.clone());
-                match path {
-                    Some(p) => {
-                        let text = p.display().to_string();
-                        match link::copy(&text) {
-                            Ok(()) => app.flash("path copied to the clipboard"),
-                            Err(e) => app.flash(format!("clipboard: {e}")),
-                        }
-                    }
-                    None => app.flash("no worktree yet — ↵ creates one"),
-                }
-            }
-
-            // Git.
-            KeyCode::Char('b') => {
-                if let Some(p) = require_path(app) {
-                    if emit(app, format!("rebase\t{p}")) {
-                        break;
-                    }
-                }
-            }
-            KeyCode::Char('p') => {
-                let remote = app.workstream().map(|w| w.git.remote_branch.clone());
-                if let (Some(p), Some(remote)) = (require_path(app), remote) {
-                    if emit(app, format!("push\t{p}\t{remote}")) {
-                        break;
-                    }
-                }
-            }
-
-            KeyCode::Char('d') => confirm_delete(app),
-            KeyCode::Char('r') => app.start_refresh(),
-            KeyCode::Char('R') => app.start_scan(false),
-            KeyCode::Char('a') => {
-                app.auto = !app.auto;
-                let msg = if app.auto {
-                    "auto-refresh on"
-                } else {
-                    "auto-refresh off"
-                };
-                app.flash(msg);
-            }
-            // A materialized row is a cd. A virtual one has nowhere to go yet,
-            // so it becomes a request to create it -- handed to the shell, which
-            // can show the build and be interrupted.
-            KeyCode::Enter => {
-                if activate(app) {
-                    break;
-                }
-            }
-            _ => {}
+        if handle_key(app, key) {
+            break;
         }
     }
     Ok(())
+}
+
+/// Handle one keypress. Returns true to leave the loop.
+///
+/// Split out of `run` so it can be driven without a terminal -- the event loop
+/// needs a real tty, this does not, and every key-handling bug so far has been
+/// in code that only a tty could reach.
+fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+    if app.filtering {
+        match key.code {
+            KeyCode::Esc => {
+                app.filtering = false;
+                app.filter = None;
+            }
+            KeyCode::Enter => app.filtering = false,
+            KeyCode::Backspace => {
+                if let Some(f) = &mut app.filter {
+                    f.pop();
+                }
+            }
+            KeyCode::Char(c) => app.filter.get_or_insert_with(String::new).push(c),
+            _ => {}
+        }
+        app.project_idx = 0;
+        app.workstream_idx = 0;
+        return false;
+    }
+
+    // A confirmation swallows every key but y/n: a destructive action must
+    // never be one keystroke away from a mistyped navigation key.
+    if let Some(c) = &app.confirm {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let verb = c.verb.clone();
+                app.confirm = None;
+                app.action = Some(verb);
+                return true;
+            }
+            _ => app.confirm = None,
+        }
+        return false;
+    }
+
+    if app.help {
+        app.help = false;
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Char('q') => return true,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+
+        // Esc steps back rather than quitting. Quitting is `q`, and only `q`:
+        // esc is what you press to get out of the thing you are in, and having
+        // it also mean "close the program" makes leaving a filter or a pane feel
+        // like standing next to a trapdoor.
+        KeyCode::Esc => app.pane = Pane::Projects,
+        KeyCode::Char('j') | KeyCode::Down => app.move_down(),
+        KeyCode::Char('k') | KeyCode::Up => app.move_up(),
+        KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right => app.pane = Pane::Workstreams,
+        KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Left => app.pane = Pane::Projects,
+        KeyCode::Char('/') => {
+            app.filtering = true;
+            app.filter = Some(String::new());
+        }
+        KeyCode::Char('?') => app.help = true,
+        KeyCode::Char('o') => open_url(app),
+
+        // Navigate and launch.
+        KeyCode::Char('g') => {
+            if let Some(p) = require_path(app) {
+                if emit(app, format!("lazygit\t{p}")) {
+                    return true;
+                }
+            }
+        }
+        KeyCode::Char('e') => {
+            if let Some(p) = require_path(app) {
+                if emit(app, format!("edit\t{p}")) {
+                    return true;
+                }
+            }
+        }
+        KeyCode::Char('y') => {
+            let path = app.workstream().and_then(|w| w.path.clone());
+            match path {
+                Some(p) => {
+                    let text = p.display().to_string();
+                    match link::copy(&text) {
+                        Ok(()) => app.flash("path copied to the clipboard"),
+                        Err(e) => app.flash(format!("clipboard: {e}")),
+                    }
+                }
+                None => app.flash("no worktree yet — ↵ creates one"),
+            }
+        }
+
+        // Git.
+        KeyCode::Char('b') => {
+            if let Some(p) = require_path(app) {
+                if emit(app, format!("rebase\t{p}")) {
+                    return true;
+                }
+            }
+        }
+        KeyCode::Char('p') => {
+            let remote = app.workstream().map(|w| w.git.remote_branch.clone());
+            if let (Some(p), Some(remote)) = (require_path(app), remote) {
+                if emit(app, format!("push\t{p}\t{remote}")) {
+                    return true;
+                }
+            }
+        }
+
+        KeyCode::Char('d') => confirm_delete(app),
+        KeyCode::Char('r') => app.start_refresh(),
+        KeyCode::Char('R') => app.start_scan(false),
+        KeyCode::Char('a') => {
+            app.auto = !app.auto;
+            let msg = if app.auto {
+                "auto-refresh on"
+            } else {
+                "auto-refresh off"
+            };
+            app.flash(msg);
+        }
+        // A materialized row is a cd. A virtual one has nowhere to go yet,
+        // so it becomes a request to create it -- handed to the shell, which
+        // can show the build and be interrupted.
+        KeyCode::Enter => {
+            if activate(app) {
+                return true;
+            }
+        }
+        _ => {}
+    }
+
+    false
 }
 
 /// Route a mouse event to whichever pane it landed in. Returns true to quit,
@@ -563,4 +582,81 @@ fn dump(no_gh: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+    fn esc() -> KeyEvent {
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+    }
+
+    /// An app with no projects is enough: every assertion here is about pane
+    /// focus and quitting, neither of which needs anything on screen.
+    fn app() -> App {
+        let mut a = App::new().expect("app");
+        a.loading = false;
+        a
+    }
+
+    #[test]
+    fn esc_never_quits() {
+        let mut a = app();
+        a.pane = Pane::Workstreams;
+        assert!(!handle_key(&mut a, esc()));
+        assert!(!handle_key(&mut a, esc()), "esc on the left pane still stays");
+    }
+
+    #[test]
+    fn esc_drops_focus_back_to_projects() {
+        let mut a = app();
+        a.pane = Pane::Workstreams;
+        handle_key(&mut a, esc());
+        assert!(a.pane == Pane::Projects);
+    }
+
+    #[test]
+    fn esc_clears_a_filter_without_quitting() {
+        let mut a = app();
+        handle_key(&mut a, key('/'));
+        handle_key(&mut a, key('x'));
+        assert_eq!(a.filter.as_deref(), Some("x"));
+        assert!(!handle_key(&mut a, esc()));
+        assert!(a.filter.is_none() && !a.filtering);
+    }
+
+    #[test]
+    fn esc_cancels_a_confirmation_without_acting() {
+        let mut a = app();
+        a.confirm = Some(app::Confirm {
+            title: "t".into(),
+            body: vec![],
+            verb: "delete\tp/w".into(),
+        });
+        assert!(!handle_key(&mut a, esc()));
+        assert!(a.confirm.is_none());
+        assert!(a.action.is_none(), "cancelling must not emit the verb");
+    }
+
+    #[test]
+    fn q_quits_and_ctrl_c_quits() {
+        assert!(handle_key(&mut app(), key('q')));
+        assert!(handle_key(
+            &mut app(),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        ));
+    }
+
+    #[test]
+    fn q_inside_a_filter_is_typed_not_obeyed() {
+        let mut a = app();
+        handle_key(&mut a, key('/'));
+        assert!(!handle_key(&mut a, key('q')));
+        assert_eq!(a.filter.as_deref(), Some("q"));
+    }
 }
