@@ -593,16 +593,9 @@ fn open_github_menu(app: &mut App) {
 fn run_github(app: &mut App, label: String, value: String) {
     // `rerun:` carries a url, which has colons of its own, so the split takes
     // only the first.
-    let (verb, rest) = match value.split_once(':') {
-        Some((v, r)) => (v, r.to_string()),
-        None => {
-            // A url: copy it, since this VM has no browser to open into.
-            match link::copy(&value) {
-                Ok(()) => app.flash(format!("{label} copied")),
-                Err(e) => app.flash(format!("clipboard: {e}")),
-            }
-            return;
-        }
+    let Some((verb, rest)) = value.split_once(':').map(|(v, r)| (v, r.to_string())) else {
+        app.flash(format!("unknown action: {label}"));
+        return;
     };
 
     match verb {
@@ -647,16 +640,23 @@ fn open_copy_menu(app: &mut App) {
 fn copy_selected(app: &mut App) {
     let kind = app.copy_menu.as_ref().map(|m| m.kind);
     if kind == Some(app::MenuKind::Github) {
-        let Some((label, value)) = app
+        let Some((label, value, action)) = app
             .copy_menu
             .as_ref()
             .and_then(|m| m.selected())
-            .map(|i| (i.label.clone(), i.action.clone().unwrap_or_else(|| i.value.clone())))
+            .map(|i| (i.label.clone(), i.value.clone(), i.action.clone()))
         else {
             return;
         };
         app.copy_menu = None;
-        run_github(app, label, value);
+        match action {
+            Some(a) => run_github(app, label, a),
+            // No action: it is a url or other text, and copying is the whole job.
+            None => match link::copy(&value) {
+                Ok(()) => app.flash(format!("{label} copied")),
+                Err(e) => app.flash(format!("clipboard: {e}")),
+            },
+        }
         return;
     }
     if kind == Some(app::MenuKind::Reviewer) {
@@ -1081,5 +1081,66 @@ mod ci_url_tests {
         };
         assert!(c.ci_url().is_none());
         assert!(c.failing().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod github_menu_tests {
+    use super::*;
+    use model::*;
+
+    fn ws(pr: Option<PrInfo>) -> Workstream {
+        Workstream {
+            project: "p".into(),
+            name: "w".into(),
+            origin: Origin::Worktree,
+            path: Some(std::path::PathBuf::from("/tmp/w")),
+            git: GitState { branch: "p/w".into(), remote_branch: "brian/p/w".into(), ..Default::default() },
+            merged: Merged::No,
+            pr,
+        }
+    }
+
+    fn pr(state: PrState) -> PrInfo {
+        PrInfo {
+            number: 9083,
+            state,
+            url: "https://github.com/votingworks/vxsuite/pull/9083".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Entries that copy must carry no action; entries that act must carry one
+    /// whose verb is recognised. A url in `value` was being split on its scheme
+    /// colon and reported as an unknown action.
+    #[test]
+    fn every_entry_is_either_a_copy_or_a_known_action() {
+        for state in [PrState::Draft, PrState::Open] {
+            for item in CopyMenu::github_for(&ws(Some(pr(state)))) {
+                match &item.action {
+                    None => assert!(
+                        !item.value.is_empty(),
+                        "copy entry {:?} has nothing to copy",
+                        item.label
+                    ),
+                    Some(a) => {
+                        let verb = a.split_once(':').map(|(v, _)| v).unwrap_or("");
+                        assert!(
+                            matches!(verb, "ready" | "ready-review" | "review" | "rerun"),
+                            "entry {:?} has unknown verb {verb:?}",
+                            item.label
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_workstream_with_no_pr_still_offers_the_compare_url() {
+        let items = CopyMenu::github_for(&ws(None));
+        assert_eq!(items.len(), 1);
+        assert!(items[0].action.is_none());
+        assert!(items[0].value.starts_with("https://github.com/"));
     }
 }
