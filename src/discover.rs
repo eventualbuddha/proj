@@ -30,6 +30,31 @@ fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").expect("HOME is not set"))
 }
 
+/// Which project and workstream a directory sits in, if any.
+///
+/// Deeper paths still resolve to the workstream that contains them, so this
+/// works from anywhere inside a worktree rather than only at its root -- which
+/// is where you actually are when you decide to run `proj`.
+pub fn locate(dir: &Path) -> Option<(String, Option<String>)> {
+    let root = projects_root();
+    let root = root.canonicalize().unwrap_or(root);
+    let dir = dir.canonicalize().ok()?;
+
+    let rel = dir.strip_prefix(&root).ok()?;
+    let mut parts = rel.components();
+    let project = parts.next()?.as_os_str().to_string_lossy().to_string();
+
+    // A directory under the root is only a project if it is one.
+    if !root.join(&project).join("README.md").is_file() {
+        return None;
+    }
+
+    let workstream = parts
+        .next()
+        .map(|c| c.as_os_str().to_string_lossy().to_string());
+    Some((project, workstream))
+}
+
 /// Read the leading `---` fenced block of a README as key/value pairs.
 ///
 /// A hand-rolled reader for a documented, hand-written schema of scalar keys and

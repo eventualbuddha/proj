@@ -29,7 +29,7 @@ fn main() -> Result<()> {
         println!("  proj              the TUI");
         println!("  proj --dump       print the same state as text");
         println!("  proj --cd-file F  write the chosen workstream's path to F on exit");
-        println!("  proj --select P   open focused on project P");
+        println!("  proj --select P[/W]  open focused there; defaults to the cwd");
         println!("  proj --render     draw one frame to stdout and exit");
         println!("  proj --render --loading   draw the pre-scan frame");
         println!("  proj --render --styles N  dump the resolved fg/bg of row N");
@@ -109,19 +109,56 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Open focused on a named project, so `proj --select react-19` lands where you
-/// meant rather than at the top of the list.
+/// Open focused on a workstream: the one `--select` names, or -- failing that --
+/// whichever one the current directory is inside.
+///
+/// Falling back to the cwd is the common case. You run `proj` while standing in
+/// the thing you are working on, and having it open at the top of an alphabetical
+/// list means scrolling back to where you already were.
 fn select(app: &mut App, args: &[String]) {
-    let Some(slug) = args
+    let explicit = args
         .iter()
         .position(|a| a == "--select")
         .and_then(|i| args.get(i + 1))
+        .map(|s| {
+            let mut it = s.splitn(2, '/');
+            (
+                it.next().unwrap_or_default().to_string(),
+                it.next().map(str::to_string),
+            )
+        });
+
+    let target = explicit.or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|d| discover::locate(&d))
+    });
+
+    let Some((project, workstream)) = target else {
+        return;
+    };
+
+    let visible = app.visible();
+    let Some(i) = visible
+        .iter()
+        .position(|&i| app.projects[i].slug == project)
     else {
         return;
     };
-    if let Some(i) = app.visible().iter().position(|&i| &app.projects[i].slug == slug) {
-        app.project_idx = i;
-        app.pane = Pane::Workstreams;
+    app.project_idx = i;
+    app.pane = Pane::Workstreams;
+
+    // Only move into the workstreams pane's selection if the name resolves; a
+    // path pointing at a directory that is not a workstream should still land
+    // you on the right project.
+    if let Some(name) = workstream {
+        if let Some(j) = app.projects[visible[i]]
+            .workstreams
+            .iter()
+            .position(|w| w.name == name)
+        {
+            app.workstream_idx = j;
+        }
     }
 }
 

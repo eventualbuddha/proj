@@ -91,6 +91,7 @@ function __proj_help
     echo "                                          With --rebase, rebase on main and rebuild after"
     echo "  ls|list                                 List projects and their workstreams"
     echo "  (no args)                               Open the dashboard: PRs, CI, merged-ness, virtual rows"
+    echo "                                          Opens on the workstream you are standing in, if any"
     echo "  tui [--select <project>]                Same, opened on a project"
     echo "  dump                                    Print the dashboard's state as text"
     echo "  status|st [<project>]                   Show each workstream's branch, drift and dirtiness"
@@ -135,8 +136,10 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
             if string match -q "$root/*" -- "$ref"
                 set ref (string replace -- "$root/" "" "$ref")
             end
+            # The whole <project>/<workstream>, not just the project: coming back
+            # from a rebase should land on the row you rebased.
             if test -n "$ref"
-                set reopen --select (string split -m1 / -- "$ref")[1]
+                set reopen --select "$ref"
             end
         end
 
