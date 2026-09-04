@@ -42,7 +42,7 @@ pub enum Msg {
     /// one back would clobber anything fetched lazily since the copy was taken,
     /// and would re-enter the scan handler.
     Merged(Vec<(String, Merged)>),
-    Contexts(u32, Vec<String>),
+    Contexts(u32, Vec<Check>),
 }
 
 /// Where to open, and whether that request is strong enough to move focus.
@@ -68,6 +68,12 @@ pub struct CopyMenu {
     pub idx: usize,
 }
 
+/// Strip the `ci/circleci: ` prefix every context here carries, so the job name
+/// is what shows.
+fn short_job(name: &str) -> String {
+    name.rsplit(": ").next().unwrap_or(name).to_string()
+}
+
 impl CopyMenu {
     /// Everything copyable about a workstream, most-wanted first, skipping
     /// whatever does not apply -- a virtual row has no path, an unpushed branch
@@ -89,10 +95,15 @@ impl CopyMenu {
         if let Some(pr) = &w.pr {
             if !pr.url.is_empty() {
                 items.push(("PR url".into(), pr.url.clone()));
-                items.push((
-                    "checks url".into(),
-                    format!("{}/checks", pr.url.trim_end_matches('/')),
-                ));
+            }
+            // The CircleCI job itself. Labelled with the job name, because
+            // "the failing one" and "the first one" are different links and you
+            // should be able to see which you are about to take.
+            if let Some(c) = pr.checks.ci_url() {
+                if !c.url.is_empty() {
+                    let label = if c.failed { "CI (failing)" } else { "CI" };
+                    items.push((format!("{label} {}", short_job(&c.name)), c.url.clone()));
+                }
             }
             items.push(("PR number".into(), format!("#{}", pr.number)));
             if !pr.title.is_empty() {
@@ -306,7 +317,9 @@ impl App {
     pub fn request_contexts(&mut self) {
         let Some(w) = self.workstream() else { return };
         let Some(pr) = &w.pr else { return };
-        if pr.checks.failing.is_some() || pr.checks.state != CheckState::Failure {
+        // Fetched for any PR with checks, not only failing ones: the copy menu
+        // wants a CI url whatever colour the rollup is.
+        if pr.checks.contexts.is_some() || pr.checks.is_empty() {
             return;
         }
         let number = pr.number;
@@ -317,7 +330,7 @@ impl App {
         std::thread::spawn(move || {
             // An empty list on failure, so the row settles into "no names" rather
             // than spinning forever.
-            let list = github::failing_contexts(OWNER, REPO, number).unwrap_or_default();
+            let list = github::contexts(OWNER, REPO, number).unwrap_or_default();
             let _ = tx.send(Msg::Contexts(number, list));
         });
     }
@@ -400,7 +413,7 @@ impl App {
                         for w in &mut p.workstreams {
                             if let Some(pr) = &mut w.pr {
                                 if pr.number == number {
-                                    pr.checks.failing = Some(list.clone());
+                                    pr.checks.contexts = Some(list.clone());
                                 }
                             }
                         }
@@ -583,21 +596,21 @@ impl App {
         }
     }
 
-    fn failing_by_pr(&self) -> Vec<(u32, Vec<String>)> {
+    fn failing_by_pr(&self) -> Vec<(u32, Vec<Check>)> {
         self.projects
             .iter()
             .flat_map(|p| p.workstreams.iter())
             .filter_map(|w| w.pr.as_ref())
-            .filter_map(|pr| pr.checks.failing.clone().map(|f| (pr.number, f)))
+            .filter_map(|pr| pr.checks.contexts.clone().map(|f| (pr.number, f)))
             .collect()
     }
 
-    fn restore_failing(&mut self, failing: &[(u32, Vec<String>)]) {
+    fn restore_failing(&mut self, failing: &[(u32, Vec<Check>)]) {
         for p in &mut self.projects {
             for w in &mut p.workstreams {
                 if let Some(pr) = &mut w.pr {
                     if let Some((_, f)) = failing.iter().find(|(n, _)| *n == pr.number) {
-                        pr.checks.failing = Some(f.clone());
+                        pr.checks.contexts = Some(f.clone());
                     }
                 }
             }

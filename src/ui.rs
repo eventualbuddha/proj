@@ -508,14 +508,15 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(DIM),
                 ),
             ]));
-            if let Some(failing) = &pr.checks.failing {
-                for name in failing.iter().take(3) {
+            let failing = pr.checks.failing();
+            if !failing.is_empty() {
+                for c in failing.iter().take(3) {
                     lines.push(Line::from(vec![
                         Span::styled("   ", Style::default().fg(DIM)),
-                        Span::styled(format!("✗ {name}"), Style::default().fg(Color::Red)),
+                        Span::styled(format!("✗ {}", c.name), Style::default().fg(Color::Red)),
                     ]));
                 }
-            } else if pr.checks.state == CheckState::Failure {
+            } else if pr.checks.contexts.is_none() && pr.checks.state == CheckState::Failure {
                 lines.push(Line::from(vec![
                     Span::styled("   ", Style::default().fg(DIM)),
                     Span::styled(spinner(), Style::default().fg(Color::Yellow)),

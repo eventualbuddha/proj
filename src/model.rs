@@ -230,6 +230,19 @@ impl CheckState {
     }
 }
 
+/// One check context, with wherever it reports to.
+///
+/// For this repo that is always CircleCI: every context is a StatusContext
+/// named `ci/circleci: <job>` whose targetUrl is that job's page. A "checks
+/// url" built by appending /checks to the PR only ever gets you GitHub's own
+/// summary tab, which is a list of links to these.
+#[derive(Debug, Clone)]
+pub struct Check {
+    pub name: String,
+    pub url: String,
+    pub failed: bool,
+}
+
 /// The rollup of a commit's check runs.
 ///
 /// Only the rollup *state* and the context count come from the list query. The
@@ -242,13 +255,28 @@ impl CheckState {
 pub struct Checks {
     pub state: CheckState,
     pub total: u32,
-    /// Populated lazily, by the detail pane.
-    pub failing: Option<Vec<String>>,
+    /// Every context, fetched lazily for the selected row.
+    pub contexts: Option<Vec<Check>>,
 }
 
 impl Checks {
     pub fn is_empty(&self) -> bool {
         self.total == 0
+    }
+
+    pub fn failing(&self) -> Vec<&Check> {
+        self.contexts
+            .as_ref()
+            .map(|c| c.iter().filter(|c| c.failed).collect())
+            .unwrap_or_default()
+    }
+
+    /// The CI page worth opening: the first failing job if anything failed,
+    /// otherwise the first job at all. When something is red that is the only
+    /// one you want; when nothing is, any of them reaches the workflow.
+    pub fn ci_url(&self) -> Option<&Check> {
+        let all = self.contexts.as_ref()?;
+        all.iter().find(|c| c.failed).or_else(|| all.first())
     }
 }
 

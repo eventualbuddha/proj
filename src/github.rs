@@ -76,8 +76,8 @@ query($owner: String!, $name: String!, $number: Int!) {
               contexts(first: 100) {
                 nodes {
                   __typename
-                  ... on CheckRun { name conclusion status }
-                  ... on StatusContext { context state }
+                  ... on CheckRun { name conclusion status detailsUrl }
+                  ... on StatusContext { context state targetUrl }
                 }
               }
             }
@@ -228,8 +228,9 @@ pub fn refresh(owner: &str, name: &str, branches: &[String]) -> Result<Cache> {
     Ok(cache)
 }
 
-/// The names of a PR's failing checks. One request, for one PR, on demand.
-pub fn failing_contexts(owner: &str, name: &str, number: u32) -> Result<Vec<String>> {
+/// Every check context for a PR, with its url. One request, for one PR, on
+/// demand.
+pub fn contexts(owner: &str, name: &str, number: u32) -> Result<Vec<Check>> {
     let args: Vec<String> = vec![
         "api".into(),
         "graphql".into(),
@@ -251,22 +252,32 @@ pub fn failing_contexts(owner: &str, name: &str, number: u32) -> Result<Vec<Stri
         .cloned()
         .unwrap_or_default();
 
-    let mut failing = Vec::new();
+    let mut out = Vec::new();
     for c in nodes {
-        // A CheckRun reports conclusion; a StatusContext reports state.
+        // A CheckRun reports conclusion and detailsUrl; a StatusContext reports
+        // state and targetUrl.
         let verdict = c["conclusion"]
             .as_str()
             .or_else(|| c["state"].as_str())
             .unwrap_or("");
-        if matches!(
-            verdict,
-            "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED"
-        ) {
-            let label = c["name"].as_str().or_else(|| c["context"].as_str()).unwrap_or("?");
-            failing.push(label.to_string());
-        }
+        out.push(Check {
+            name: c["name"]
+                .as_str()
+                .or_else(|| c["context"].as_str())
+                .unwrap_or("?")
+                .to_string(),
+            url: c["detailsUrl"]
+                .as_str()
+                .or_else(|| c["targetUrl"].as_str())
+                .unwrap_or("")
+                .to_string(),
+            failed: matches!(
+                verdict,
+                "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED"
+            ),
+        });
     }
-    Ok(failing)
+    Ok(out)
 }
 
 /// Fold a cache into the workstreams whose branch matches.
@@ -296,7 +307,7 @@ pub fn apply(projects: &mut [Project], cache: &Cache) {
                 checks: Checks {
                     state: CheckState::parse(&c.check_state),
                     total: c.check_total,
-                    failing: None,
+                    contexts: None,
                 },
             });
         }

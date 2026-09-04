@@ -793,7 +793,10 @@ mod copy_tests {
         let w = a.workstream().unwrap();
         assert_eq!(labels.contains(&"worktree path"), w.path.is_some());
         assert_eq!(labels.contains(&"PR url"), w.pr.is_some());
-        assert_eq!(labels.contains(&"checks url"), w.pr.is_some());
+        assert!(
+            !labels.iter().any(|l| l.contains("checks url")),
+            "the /checks tab is GitHub's list of links, not a CI page"
+        );
 
         // Every entry has something to copy.
         assert!(menu.items.iter().all(|(_, v)| !v.is_empty()));
@@ -853,5 +856,53 @@ mod copy_tests {
             "a digit past the end must not copy the selected entry instead"
         );
         assert_eq!(a.copy_menu.as_ref().unwrap().idx, 0, "and must not move");
+    }
+}
+
+#[cfg(test)]
+mod ci_url_tests {
+    use super::*;
+    use model::{Check, CheckState, Checks};
+
+    fn checks(c: Vec<Check>) -> Checks {
+        Checks {
+            state: CheckState::Failure,
+            total: c.len() as u32,
+            contexts: Some(c),
+        }
+    }
+    fn check(name: &str, failed: bool) -> Check {
+        Check {
+            name: format!("ci/circleci: {name}"),
+            url: format!("https://circleci.com/gh/votingworks/vxsuite/{}", name.len()),
+            failed,
+        }
+    }
+
+    #[test]
+    fn ci_url_prefers_the_failing_job() {
+        let c = checks(vec![
+            check("build", false),
+            check("test-admin", true),
+            check("test-scan", true),
+        ]);
+        assert_eq!(c.ci_url().unwrap().name, "ci/circleci: test-admin");
+    }
+
+    #[test]
+    fn ci_url_falls_back_to_the_first_job_when_all_pass() {
+        let c = checks(vec![check("build", false), check("test-admin", false)]);
+        assert_eq!(c.ci_url().unwrap().name, "ci/circleci: build");
+    }
+
+    #[test]
+    fn ci_url_is_absent_until_contexts_are_fetched() {
+        let c = Checks {
+            state: CheckState::Failure,
+            total: 64,
+            contexts: None,
+        };
+        assert!(c.ci_url().is_none());
+        assert!(c.failing().is_empty());
     }
 }
