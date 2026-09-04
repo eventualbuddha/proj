@@ -18,7 +18,7 @@ use crossterm::terminal::{
 use std::io::stdout;
 use std::time::Duration;
 
-use app::{App, Confirm, Pane, Select};
+use app::{App, Confirm, CopyMenu, Pane, Select};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -249,6 +249,35 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         return false;
     }
 
+    // The copy menu owns the keyboard while it is open.
+    if let Some(menu) = &mut app.copy_menu {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.copy_menu = None,
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !menu.items.is_empty() {
+                    menu.idx = (menu.idx + 1) % menu.items.len();
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if !menu.items.is_empty() {
+                    menu.idx = (menu.idx + menu.items.len() - 1) % menu.items.len();
+                }
+            }
+            // Digits jump straight to an entry and copy it, so the common case
+            // is two keystrokes rather than a scroll.
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let n = c.to_digit(10).unwrap() as usize - 1;
+                if n < menu.items.len() {
+                    menu.idx = n;
+                    copy_selected(app);
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('y') => copy_selected(app),
+            _ => {}
+        }
+        return false;
+    }
+
     // A confirmation swallows every key but y/n: a destructive action must
     // never be one keystroke away from a mistyped navigation key.
     if let Some(c) = &app.confirm {
@@ -304,19 +333,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 }
             }
         }
-        KeyCode::Char('y') => {
-            let path = app.workstream().and_then(|w| w.path.clone());
-            match path {
-                Some(p) => {
-                    let text = p.display().to_string();
-                    match link::copy(&text) {
-                        Ok(()) => app.flash("path copied to the clipboard"),
-                        Err(e) => app.flash(format!("clipboard: {e}")),
-                    }
-                }
-                None => app.flash("no worktree yet — ↵ creates one"),
-            }
-        }
+        KeyCode::Char('y') => open_copy_menu(app),
 
         // Git.
         KeyCode::Char('b') => {
@@ -446,6 +463,36 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: ratatui::layout::Rect) -> bo
             }
         }
         _ => false,
+    }
+}
+
+/// Build the copy menu for the selected row.
+fn open_copy_menu(app: &mut App) {
+    let project_dir = app
+        .project()
+        .and_then(|p| p.readme.parent().map(|d| d.to_path_buf()));
+    let Some(w) = app.workstream().cloned() else {
+        app.flash("nothing selected");
+        return;
+    };
+    app.copy_menu = Some(CopyMenu::build(&w, project_dir.as_deref()));
+}
+
+/// Copy the highlighted entry and close the menu.
+fn copy_selected(app: &mut App) {
+    let Some((label, value)) = app
+        .copy_menu
+        .as_ref()
+        .and_then(|m| m.selected())
+        .cloned()
+    else {
+        app.copy_menu = None;
+        return;
+    };
+    app.copy_menu = None;
+    match link::copy(&value) {
+        Ok(()) => app.flash(format!("{label} copied")),
+        Err(e) => app.flash(format!("clipboard: {e}")),
     }
 }
 
@@ -704,5 +751,107 @@ mod select_tests {
         let t = select_target(&args(&[])).expect("target");
         assert_eq!(t.project, "react-19");
         assert!(!t.focus, "standing somewhere is not choosing it");
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn loaded() -> App {
+        // Drive the real startup so there is something selected to copy from.
+        let mut a = App::new().expect("app");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while a.loading && std::time::Instant::now() < deadline {
+            a.drain();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        a.pane = Pane::Workstreams;
+        a
+    }
+
+    #[test]
+    fn y_opens_a_menu_of_things_that_apply() {
+        let mut a = loaded();
+        if a.workstream().is_none() {
+            return;
+        }
+        assert!(!handle_key(&mut a, key('y')));
+        let menu = a.copy_menu.as_ref().expect("menu opened");
+        let labels: Vec<&str> = menu.items.iter().map(|(l, _)| l.as_str()).collect();
+
+        // Branch and remote branch exist for every row, materialized or not.
+        assert!(labels.contains(&"branch"));
+        assert!(labels.contains(&"remote branch"));
+
+        // Path only where there is a worktree; urls only where there is a PR.
+        let w = a.workstream().unwrap();
+        assert_eq!(labels.contains(&"worktree path"), w.path.is_some());
+        assert_eq!(labels.contains(&"PR url"), w.pr.is_some());
+        assert_eq!(labels.contains(&"checks url"), w.pr.is_some());
+
+        // Every entry has something to copy.
+        assert!(menu.items.iter().all(|(_, v)| !v.is_empty()));
+    }
+
+    #[test]
+    fn the_menu_owns_the_keyboard_and_esc_closes_it() {
+        let mut a = loaded();
+        if a.workstream().is_none() {
+            return;
+        }
+        handle_key(&mut a, key('y'));
+        // `q` must not quit the program while the menu is up.
+        assert!(!handle_key(&mut a, key('q')));
+        assert!(a.copy_menu.is_none(), "q closes the menu");
+
+        handle_key(&mut a, key('y'));
+        assert!(!handle_key(
+            &mut a,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+        ));
+        assert!(a.copy_menu.is_none());
+    }
+
+    #[test]
+    fn j_and_k_wrap_around_the_menu() {
+        let mut a = loaded();
+        if a.workstream().is_none() {
+            return;
+        }
+        handle_key(&mut a, key('y'));
+        let n = a.copy_menu.as_ref().unwrap().items.len();
+        assert!(n > 1);
+        handle_key(&mut a, key('k'));
+        assert_eq!(a.copy_menu.as_ref().unwrap().idx, n - 1, "k wraps to the end");
+        handle_key(&mut a, key('j'));
+        assert_eq!(a.copy_menu.as_ref().unwrap().idx, 0);
+    }
+
+    #[test]
+    fn an_out_of_range_digit_does_nothing() {
+        // A synthetic two-entry menu rather than a real row: a workstream with a
+        // PR offers nine or more entries, so there is no out-of-range digit to
+        // press against one. The first version of this test asserted against a
+        // real row and failed for exactly that reason.
+        let mut a = loaded();
+        a.copy_menu = Some(CopyMenu {
+            items: vec![
+                ("branch".into(), "a/b".into()),
+                ("HEAD".into(), "deadbeef".into()),
+            ],
+            idx: 0,
+        });
+        assert!(!handle_key(&mut a, key('5')));
+        assert!(
+            a.copy_menu.is_some(),
+            "a digit past the end must not copy the selected entry instead"
+        );
+        assert_eq!(a.copy_menu.as_ref().unwrap().idx, 0, "and must not move");
     }
 }

@@ -25,6 +25,11 @@ const REVIEW_ICON: &str = "\u{f4a5}";
 const DIRTY_ICON: &str = "\u{f448}";
 const OP_ICON: &str = "\u{f071}";
 
+/// The selection in a pane that does not have the cursor. A muted accent rather
+/// than the accent itself: two identically-highlighted rows in two panes is two
+/// claims about where the cursor is, and only one of them is true.
+const ACCENT_MUTED: Color = Color::Rgb(0x3b, 0x33, 0x4f);
+
 /// lazygit's colours for the rollup states, so a check reads the same in both
 /// tools: green passing, yellow pending, red failing *and* error, plain for a
 /// required check that has not reported yet.
@@ -115,6 +120,44 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             44,
             7,
         );
+    } else if let Some(menu) = &app.copy_menu {
+        let mut text = vec![Line::from("")];
+        for (i, (label, value)) in menu.items.iter().enumerate() {
+            let on = i == menu.idx;
+            // The value, not just the label: which of two branch-shaped strings
+            // you meant is decided by seeing them, and the whole reason this
+            // menu exists is that the label alone does not tell you.
+            text.push(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", i + 1),
+                    if on {
+                        Style::default().bg(ACCENT).fg(Color::White)
+                    } else {
+                        Style::default().fg(DIM)
+                    },
+                ),
+                Span::styled(
+                    format!(" {label:<14}"),
+                    if on {
+                        Style::default().bold()
+                    } else {
+                        Style::default()
+                    },
+                ),
+                Span::styled(truncate(value, 52), Style::default().fg(DIM)),
+            ]));
+        }
+        text.push(Line::from(""));
+        text.push(Line::from(vec![
+            Span::styled("↵/1-9", Style::default().fg(ACCENT)),
+            Span::styled(" copy   ", Style::default().fg(DIM)),
+            Span::styled("j/k", Style::default().fg(ACCENT)),
+            Span::styled(" move   ", Style::default().fg(DIM)),
+            Span::styled("esc", Style::default().fg(ACCENT)),
+            Span::styled(" cancel", Style::default().fg(DIM)),
+        ]));
+        let h = text.len() as u16 + 2;
+        draw_modal_left(f, " copy ", text, 78, h);
     } else if let Some(c) = &app.confirm {
         let mut text = vec![Line::from("")];
         for line in &c.body {
@@ -187,7 +230,13 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
             .block(border("Projects", app.pane == Pane::Projects))
             // Background only, no fg: otherwise the selected project's health
             // glyph loses its red/green and every project looks equally fine.
-            .highlight_style(Style::default().bg(ACCENT)),
+            // Muted when the cursor is elsewhere -- the project stays visible as
+            // context for the pane on the right without competing with it.
+            .highlight_style(Style::default().bg(if app.pane == Pane::Projects {
+                ACCENT
+            } else {
+                ACCENT_MUTED
+            })),
         area,
         &mut app.list_state,
     );
@@ -205,6 +254,7 @@ fn draw_workstreams(f: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let selected = app.workstream_idx;
+    let focused = app.pane == Pane::Workstreams;
     let rows: Vec<Row> = project
         .workstreams
         .iter()
@@ -282,7 +332,7 @@ fn draw_workstreams(f: &mut Frame, app: &mut App, area: Rect) {
                         Style::default().fg(Color::Yellow).bold(),
                     )])),
                 ])
-                .style(if is_selected {
+                .style(if is_selected && focused {
                     Style::default().bg(ACCENT)
                 } else {
                     Style::default()
@@ -304,7 +354,10 @@ fn draw_workstreams(f: &mut Frame, app: &mut App, area: Rect) {
             // purple and threw away the one signal it carries. A row background
             // is underneath instead: spans that set their own colours keep them,
             // and spans that do not inherit it.
-            .style(if is_selected {
+            // No highlight at all while the cursor is on the left: a row
+            // "selected" in a pane you are not in is only going to be read as
+            // where you are.
+            .style(if is_selected && focused {
                 Style::default().bg(ACCENT)
             } else {
                 Style::default()
@@ -510,6 +563,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" rebase  ", Style::default().fg(DIM)),
         Span::styled("p", Style::default().fg(ACCENT)),
         Span::styled(" push  ", Style::default().fg(DIM)),
+        Span::styled("y", Style::default().fg(ACCENT)),
+        Span::styled(" copy  ", Style::default().fg(DIM)),
         Span::styled("o", Style::default().fg(ACCENT)),
         Span::styled(" url  ", Style::default().fg(DIM)),
         Span::styled("?", Style::default().fg(ACCENT)),
@@ -553,6 +608,21 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_modal(f: &mut Frame, title: &str, text: Vec<Line>, w: u16, h: u16) {
+    draw_modal_aligned(f, title, text, w, h, Alignment::Center)
+}
+
+fn draw_modal_left(f: &mut Frame, title: &str, text: Vec<Line>, w: u16, h: u16) {
+    draw_modal_aligned(f, title, text, w, h, Alignment::Left)
+}
+
+fn draw_modal_aligned(
+    f: &mut Frame,
+    title: &str,
+    text: Vec<Line>,
+    w: u16,
+    h: u16,
+    align: Alignment,
+) {
     let area = centered(w, h, f.area());
     f.render_widget(Clear, area);
     f.render_widget(
@@ -563,7 +633,7 @@ fn draw_modal(f: &mut Frame, title: &str, text: Vec<Line>, w: u16, h: u16) {
                     .border_style(Style::default().fg(ACCENT))
                     .title(title.to_string()),
             )
-            .alignment(Alignment::Center),
+            .alignment(align),
         area,
     );
 }
@@ -581,7 +651,8 @@ fn draw_help(f: &mut Frame) {
         Line::from(Span::styled("  acting on the selected workstream", Style::default().bold())),
         Line::from("  g               lazygit, scoped to its worktree"),
         Line::from("  e               $EDITOR there"),
-        Line::from("  y               copy its path      o   its PR url"),
+        Line::from("  y               copy menu: path, branch, sha, PR url, checks url…"),
+        Line::from("  o               open its PR url, or copy it"),
         Line::from("  b               rebase on main, then rebuild"),
         Line::from("  p               push, to brian/<project>/<workstream>"),
         Line::from("  d               delete it, after confirming"),

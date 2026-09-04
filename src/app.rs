@@ -57,6 +57,60 @@ pub struct Select {
     pub focus: bool,
 }
 
+/// A menu of things worth copying off the selected row.
+///
+/// A single copy key has to guess which of a dozen strings you meant, and it
+/// will guess wrong most of the time -- the path, the branch, the remote branch,
+/// the sha and the PR url are all things you copy out of here, and which one you
+/// want is the whole question. So it asks.
+pub struct CopyMenu {
+    pub items: Vec<(String, String)>,
+    pub idx: usize,
+}
+
+impl CopyMenu {
+    /// Everything copyable about a workstream, most-wanted first, skipping
+    /// whatever does not apply -- a virtual row has no path, an unpushed branch
+    /// no upstream, a workstream without a PR no urls.
+    pub fn build(w: &Workstream, project_dir: Option<&std::path::Path>) -> Self {
+        let mut items: Vec<(String, String)> = Vec::new();
+
+        if let Some(p) = &w.path {
+            items.push(("worktree path".into(), p.display().to_string()));
+        }
+        items.push(("branch".into(), w.git.branch.clone()));
+        items.push(("remote branch".into(), w.git.remote_branch.clone()));
+        if !w.git.head.is_empty() {
+            items.push(("HEAD".into(), w.git.head.clone()));
+        }
+        if let Some(up) = &w.git.upstream {
+            items.push(("upstream".into(), up.clone()));
+        }
+        if let Some(pr) = &w.pr {
+            if !pr.url.is_empty() {
+                items.push(("PR url".into(), pr.url.clone()));
+                items.push((
+                    "checks url".into(),
+                    format!("{}/checks", pr.url.trim_end_matches('/')),
+                ));
+            }
+            items.push(("PR number".into(), format!("#{}", pr.number)));
+            if !pr.title.is_empty() {
+                items.push(("PR title".into(), pr.title.clone()));
+            }
+        }
+        if let Some(d) = project_dir {
+            items.push(("project dir".into(), d.display().to_string()));
+        }
+
+        CopyMenu { items, idx: 0 }
+    }
+
+    pub fn selected(&self) -> Option<&(String, String)> {
+        self.items.get(self.idx)
+    }
+}
+
 pub struct Confirm {
     pub title: String,
     pub body: Vec<String>,
@@ -102,6 +156,7 @@ pub struct App {
     pub help: bool,
     /// A destructive action waiting on a yes. Holds the verb to emit.
     pub confirm: Option<Confirm>,
+    pub copy_menu: Option<CopyMenu>,
     pub filter: Option<String>,
     pub filtering: bool,
     pub tx: Sender<Msg>,
@@ -147,6 +202,7 @@ impl App {
             error: None,
             help: false,
             confirm: None,
+            copy_menu: None,
             filter: None,
             filtering: false,
             tx,
