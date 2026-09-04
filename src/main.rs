@@ -362,8 +362,8 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Esc => app.pane = Pane::Projects,
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
-        KeyCode::Tab | KeyCode::Right => app.pane = Pane::Workstreams,
-        KeyCode::BackTab | KeyCode::Left => app.pane = Pane::Projects,
+        KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right => app.pane = Pane::Workstreams,
+        KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Left => app.pane = Pane::Projects,
         KeyCode::Char('/') => {
             app.filtering = true;
             app.filter = Some(String::new());
@@ -389,14 +389,14 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         }
 
         // Navigate and launch.
-        KeyCode::Char('l') => {
+        KeyCode::Char('g') => {
             if let Some(p) = require_path(app) {
                 if emit(app, format!("lazygit\t{p}")) {
                     return true;
                 }
             }
         }
-        KeyCode::Char('g') => open_github_menu(app),
+        KeyCode::Char('G') => open_github_menu(app),
 
         // Check a review out into a disposable worktree.
         KeyCode::Char('c') if app.sidebar == app::Sidebar::Reviews => {
