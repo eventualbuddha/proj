@@ -49,14 +49,26 @@ fn main() -> Result<()> {
     // Draw one frame to an in-memory backend and print it. Exists so the layout
     // can be checked without a terminal -- in CI, over a pipe, or by anything
     // that cannot press a key.
+    //
+    // It goes through exactly the startup the TUI does, including the threaded
+    // scan and the held selection, rather than a synchronous shortcut. It used
+    // to use the shortcut, and that is how the selection silently stopped being
+    // applied at all: --render kept working because it took a path the program
+    // no longer took.
     if args.iter().any(|a| a == "--render") {
         let mut app = App::new()?;
+        app.pending_select = select_target(&args);
+
         // --loading draws the pre-scan state, which is otherwise only on screen
         // for the few hundred milliseconds the background scan takes.
         if !args.iter().any(|a| a == "--loading") {
-            app.scan_now()?;
-            select(&mut app, &args);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while app.loading && std::time::Instant::now() < deadline {
+                app.drain();
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
+
         let (w, h) = (140u16, 34u16);
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))?;
         term.draw(|f| ui::draw(f, &mut app))?;
@@ -95,8 +107,11 @@ fn main() -> Result<()> {
     }
 
     // Nothing blocking here: the scan is already running on a thread and the
-    // window goes up immediately with a loading modal over it.
+    // window goes up immediately with a loading modal over it. Which means the
+    // selection cannot be applied yet -- there is nothing to select in -- so it
+    // is held until the scan lands.
     let mut app = App::new()?;
+    app.pending_select = select_target(&args);
 
     let mut term = setup()?;
     let result = run(&mut term, &mut app);
@@ -115,7 +130,7 @@ fn main() -> Result<()> {
 /// Falling back to the cwd is the common case. You run `proj` while standing in
 /// the thing you are working on, and having it open at the top of an alphabetical
 /// list means scrolling back to where you already were.
-fn select(app: &mut App, args: &[String]) {
+fn select_target(args: &[String]) -> Option<(String, Option<String>)> {
     let explicit = args
         .iter()
         .position(|a| a == "--select")
@@ -128,38 +143,11 @@ fn select(app: &mut App, args: &[String]) {
             )
         });
 
-    let target = explicit.or_else(|| {
+    explicit.or_else(|| {
         std::env::current_dir()
             .ok()
             .and_then(|d| discover::locate(&d))
-    });
-
-    let Some((project, workstream)) = target else {
-        return;
-    };
-
-    let visible = app.visible();
-    let Some(i) = visible
-        .iter()
-        .position(|&i| app.projects[i].slug == project)
-    else {
-        return;
-    };
-    app.project_idx = i;
-    app.pane = Pane::Workstreams;
-
-    // Only move into the workstreams pane's selection if the name resolves; a
-    // path pointing at a directory that is not a workstream should still land
-    // you on the right project.
-    if let Some(name) = workstream {
-        if let Some(j) = app.projects[visible[i]]
-            .workstreams
-            .iter()
-            .position(|w| w.name == name)
-        {
-            app.workstream_idx = j;
-        }
-    }
+    })
 }
 
 fn setup() -> Result<Terminal> {

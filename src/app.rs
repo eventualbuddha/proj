@@ -80,6 +80,10 @@ pub struct App {
     pub url_row: Option<u16>,
     /// PR numbers whose failing-check names are being fetched right now.
     pub contexts_inflight: HashSet<u32>,
+    /// Where to land once the first scan arrives. The scan runs on a thread, so
+    /// at startup there is nothing to select *in* yet -- the request has to be
+    /// held until there is.
+    pub pending_select: Option<(String, Option<String>)>,
     pub list_state: ListState,
     pub table_state: TableState,
     pub error: Option<String>,
@@ -125,6 +129,7 @@ impl App {
             flash: None,
             url_row: None,
             contexts_inflight: HashSet::new(),
+            pending_select: None,
             list_state: ListState::default(),
             table_state: TableState::default(),
             error: None,
@@ -254,6 +259,7 @@ impl App {
             match msg {
                 Msg::Scanned(projects) => {
                     let first = self.loading;
+                    let pending = self.pending_select.take();
                     // A periodic scan replaces the whole tree, so anything the
                     // old one had learned and the new one cannot know has to be
                     // carried across: which row you were on, and the failing
@@ -266,7 +272,12 @@ impl App {
                     self.scanning = false;
                     self.loading = false;
                     self.restore_failing(&failing);
-                    self.restore_selection(selection);
+                    // An explicit request wins over carrying the old selection
+                    // forward; on the first scan there is no old one anyway.
+                    match pending {
+                        Some(target) => self.apply_selection(target),
+                        None => self.restore_selection(selection),
+                    }
                     self.clamp();
 
                     // The branch list is only known once the scan lands, and the
@@ -457,6 +468,26 @@ impl App {
         match p.workstreams.get(self.workstream_idx) {
             Some(w) => Some((p.slug.clone(), w.name.clone())),
             None => Some((p.slug.clone(), String::new())),
+        }
+    }
+
+    /// Land on a project, and on a workstream within it when the name resolves.
+    pub fn apply_selection(&mut self, target: (String, Option<String>)) {
+        let (project, workstream) = target;
+        let visible = self.visible();
+        let Some(i) = visible.iter().position(|&i| self.projects[i].slug == project) else {
+            return;
+        };
+        self.project_idx = i;
+        self.pane = Pane::Workstreams;
+        if let Some(name) = workstream {
+            if let Some(j) = self.projects[visible[i]]
+                .workstreams
+                .iter()
+                .position(|w| w.name == name)
+            {
+                self.workstream_idx = j;
+            }
         }
     }
 
