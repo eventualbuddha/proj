@@ -45,6 +45,18 @@ pub enum Msg {
     Contexts(u32, Vec<String>),
 }
 
+/// Where to open, and whether that request is strong enough to move focus.
+pub struct Select {
+    pub project: String,
+    pub workstream: Option<String>,
+    /// Focus the workstreams pane. True when something asked for a specific
+    /// workstream -- the wrapper reopening after lazygit or a rebase. False when
+    /// it was only inferred from the current directory: standing inside a
+    /// project says which project you care about, not that you are done choosing
+    /// within it, so the cursor stays on the left where navigation starts.
+    pub focus: bool,
+}
+
 pub struct Confirm {
     pub title: String,
     pub body: Vec<String>,
@@ -83,7 +95,7 @@ pub struct App {
     /// Where to land once the first scan arrives. The scan runs on a thread, so
     /// at startup there is nothing to select *in* yet -- the request has to be
     /// held until there is.
-    pub pending_select: Option<(String, Option<String>)>,
+    pub pending_select: Option<Select>,
     pub list_state: ListState,
     pub table_state: TableState,
     pub error: Option<String>,
@@ -472,14 +484,20 @@ impl App {
     }
 
     /// Land on a project, and on a workstream within it when the name resolves.
-    pub fn apply_selection(&mut self, target: (String, Option<String>)) {
-        let (project, workstream) = target;
+    pub fn apply_selection(&mut self, target: Select) {
+        let Select {
+            project,
+            workstream,
+            focus,
+        } = target;
         let visible = self.visible();
         let Some(i) = visible.iter().position(|&i| self.projects[i].slug == project) else {
             return;
         };
         self.project_idx = i;
-        self.pane = Pane::Workstreams;
+        if focus {
+            self.pane = Pane::Workstreams;
+        }
         if let Some(name) = workstream {
             if let Some(j) = self.projects[visible[i]]
                 .workstreams

@@ -18,7 +18,7 @@ use crossterm::terminal::{
 use std::io::stdout;
 use std::time::Duration;
 
-use app::{App, Confirm, Pane};
+use app::{App, Confirm, Pane, Select};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -130,23 +130,32 @@ fn main() -> Result<()> {
 /// Falling back to the cwd is the common case. You run `proj` while standing in
 /// the thing you are working on, and having it open at the top of an alphabetical
 /// list means scrolling back to where you already were.
-fn select_target(args: &[String]) -> Option<(String, Option<String>)> {
+fn select_target(args: &[String]) -> Option<Select> {
     let explicit = args
         .iter()
         .position(|a| a == "--select")
         .and_then(|i| args.get(i + 1))
         .map(|s| {
             let mut it = s.splitn(2, '/');
-            (
-                it.next().unwrap_or_default().to_string(),
-                it.next().map(str::to_string),
-            )
+            Select {
+                project: it.next().unwrap_or_default().to_string(),
+                workstream: it.next().map(str::to_string),
+                // Someone named this explicitly, so put the cursor on it.
+                focus: true,
+            }
         });
 
     explicit.or_else(|| {
-        std::env::current_dir()
+        let (project, workstream) = std::env::current_dir()
             .ok()
-            .and_then(|d| discover::locate(&d))
+            .and_then(|d| discover::locate(&d))?;
+        Some(Select {
+            project,
+            workstream,
+            // Inferred, not asked for: highlight the row but leave the cursor in
+            // the projects pane.
+            focus: false,
+        })
     })
 }
 
@@ -658,5 +667,42 @@ mod tests {
         handle_key(&mut a, key('/'));
         assert!(!handle_key(&mut a, key('q')));
         assert_eq!(a.filter.as_deref(), Some("q"));
+    }
+}
+
+#[cfg(test)]
+mod select_tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn explicit_select_takes_focus() {
+        let t = select_target(&args(&["--select", "react-19/react-query"])).expect("target");
+        assert_eq!(t.project, "react-19");
+        assert_eq!(t.workstream.as_deref(), Some("react-query"));
+        assert!(t.focus, "an explicit request moves the cursor");
+    }
+
+    #[test]
+    fn explicit_select_of_a_bare_project_takes_focus() {
+        let t = select_target(&args(&["--select", "react-19"])).expect("target");
+        assert_eq!(t.workstream, None);
+        assert!(t.focus);
+    }
+
+    #[test]
+    fn cwd_derived_selection_does_not_take_focus() {
+        // Ask from inside a real workstream; the fallback is the cwd.
+        let dir = discover::projects_root().join("react-19").join("react-query");
+        if !dir.is_dir() {
+            return; // nothing to assert against on a machine without it
+        }
+        std::env::set_current_dir(&dir).unwrap();
+        let t = select_target(&args(&[])).expect("target");
+        assert_eq!(t.project, "react-19");
+        assert!(!t.focus, "standing somewhere is not choosing it");
     }
 }
