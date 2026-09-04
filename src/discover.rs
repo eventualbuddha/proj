@@ -143,9 +143,20 @@ pub fn scan() -> Result<Vec<Project>> {
         for ws in sub {
             let path = ws.path();
             let name = ws.file_name().to_string_lossy().to_string();
-            let branch = git::run(&path, &["rev-parse", "--abbrev-ref", "HEAD"])
-                .unwrap_or_else(|_| "HEAD".into());
-            let git_state = git::state(&path, &branch, &base, true);
+
+            // Mid-rebase the worktree is detached and `rev-parse --abbrev-ref
+            // HEAD` answers "HEAD", so the branch name has to come from the
+            // sequencer state instead. Without it the row is nameless and the
+            // branch shows up a second time as an orphan.
+            let op = git::in_progress(&path);
+            let branch = op
+                .as_ref()
+                .and_then(|o| o.branch.clone())
+                .or_else(|| git::run(&path, &["rev-parse", "--abbrev-ref", "HEAD"]).ok())
+                .unwrap_or_else(|| "HEAD".into());
+
+            let mut git_state = git::state(&path, &branch, &base, true);
+            git_state.op = op;
 
             project.workstreams.push(Workstream {
                 project: project.slug.clone(),

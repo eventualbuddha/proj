@@ -518,14 +518,21 @@ fn dump(no_gh: bool) -> Result<()> {
                 ),
                 None => "—".into(),
             };
+            // The op, where there is one, matters more than the merged label --
+            // both here and on screen -- because everything else on the row is
+            // measured against a HEAD part-way through it.
+            let state = match &w.git.op {
+                Some(op) => op.label(),
+                None => w.merged.label().to_string(),
+            };
             println!(
-                "    {:<24} {:<8} {:<46} +{:<3} −{:<3} {:<9} {}",
+                "    {:<24} {:<8} {:<46} +{:<3} −{:<3} {:<14} {}",
                 w.name,
                 if w.is_virtual() { "virtual" } else { "" },
                 w.git.branch,
                 w.git.ahead,
                 w.git.behind,
-                w.merged.label(),
+                state,
                 pr
             );
         }

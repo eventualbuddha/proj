@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::model::{GitState, Merged};
+use crate::model::{GitState, Merged, Op, OpKind};
 
 pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
@@ -49,6 +49,67 @@ pub fn base_ref(repo: &Path) -> String {
     "main".to_string()
 }
 
+/// A sequencer operation left in progress in this worktree.
+///
+/// These matter because they *detach HEAD*. Mid-rebase, `git worktree list`
+/// reports the worktree as detached rather than on a branch, so the row loses
+/// its branch name and the branch -- now attached to no worktree -- gets picked
+/// up separately as an orphan. The same workstream then appears twice, once as a
+/// nameless worktree and once as a branch with no worktree, and neither row is
+/// true. Reading the sequencer state is what puts the name back.
+pub fn in_progress(dir: &Path) -> Option<Op> {
+    let git_path = |name: &str| ok(dir, &["rev-parse", "--git-path", name]).map(PathBuf::from);
+
+    // rebase-merge is the interactive/merge backend, rebase-apply the am one.
+    for (name, kind) in [
+        ("rebase-merge", OpKind::Rebase),
+        ("rebase-apply", OpKind::Rebase),
+    ] {
+        let Some(p) = git_path(name) else { continue };
+        if !p.is_dir() {
+            continue;
+        }
+        let read = |f: &str| std::fs::read_to_string(p.join(f)).ok();
+        // rebase-apply names its counters `next` and `last`; rebase-merge uses
+        // `msgnum` and `end`.
+        let done = read("msgnum")
+            .or_else(|| read("next"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        let total = read("end")
+            .or_else(|| read("last"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        let branch = read("head-name")
+            .map(|v| v.trim().trim_start_matches("refs/heads/").to_string())
+            .filter(|v| !v.is_empty());
+        return Some(Op {
+            kind,
+            done,
+            total,
+            branch,
+        });
+    }
+
+    for (name, kind) in [
+        ("MERGE_HEAD", OpKind::Merge),
+        ("CHERRY_PICK_HEAD", OpKind::CherryPick),
+        ("REVERT_HEAD", OpKind::Revert),
+        ("BISECT_LOG", OpKind::Bisect),
+    ] {
+        if git_path(name).is_some_and(|p| p.exists()) {
+            return Some(Op {
+                kind,
+                done: 0,
+                total: 0,
+                branch: None,
+            });
+        }
+    }
+
+    None
+}
+
 /// Every registered worktree, as branch -> path.
 ///
 /// Submodules keep their own worktrees under `.git/`, which are not ours to
@@ -57,6 +118,7 @@ pub fn worktrees(repo: &Path) -> Result<HashMap<String, PathBuf>> {
     let out = run(repo, &["worktree", "list", "--porcelain"])?;
     let mut map = HashMap::new();
     let mut path: Option<PathBuf> = None;
+    let mut detached: Vec<PathBuf> = Vec::new();
 
     for line in out.lines() {
         if let Some(rest) = line.strip_prefix("worktree ") {
@@ -67,8 +129,24 @@ pub fn worktrees(repo: &Path) -> Result<HashMap<String, PathBuf>> {
                     map.insert(rest.to_string(), p.clone());
                 }
             }
+        } else if line == "detached" {
+            if let Some(p) = &path {
+                if !p.to_string_lossy().contains("/.git/") {
+                    detached.push(p.clone());
+                }
+            }
         }
     }
+
+    // A worktree part-way through a rebase is detached, but the branch it is
+    // rebasing is still spoken for. Without this it would be reported as having
+    // no worktree and listed a second time as an orphan branch.
+    for p in detached {
+        if let Some(branch) = in_progress(&p).and_then(|op| op.branch) {
+            map.insert(branch, p);
+        }
+    }
+
     Ok(map)
 }
 

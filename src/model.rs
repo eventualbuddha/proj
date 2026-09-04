@@ -17,6 +17,43 @@ pub enum Origin {
     OrphanBranch,
 }
 
+/// A sequencer operation the worktree is part-way through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpKind {
+    Rebase,
+    Merge,
+    CherryPick,
+    Revert,
+    Bisect,
+}
+
+#[derive(Debug, Clone)]
+pub struct Op {
+    pub kind: OpKind,
+    pub done: u32,
+    pub total: u32,
+    /// The branch being rebased, from `rebase-merge/head-name`. HEAD is detached
+    /// during the operation, so this is the only place the name survives.
+    pub branch: Option<String>,
+}
+
+impl Op {
+    pub fn label(&self) -> String {
+        let verb = match self.kind {
+            OpKind::Rebase => "rebasing",
+            OpKind::Merge => "merging",
+            OpKind::CherryPick => "cherry-picking",
+            OpKind::Revert => "reverting",
+            OpKind::Bisect => "bisecting",
+        };
+        if self.total > 0 {
+            format!("{verb} {}/{}", self.done, self.total)
+        } else {
+            verb.to_string()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GitState {
     pub branch: String,
@@ -40,6 +77,10 @@ pub struct GitState {
     /// Unix seconds of the branch tip's commit date.
     pub last_commit: Option<i64>,
     pub head: String,
+    /// Set when the worktree is mid-rebase, mid-merge, and so on. While it is
+    /// set, `branch` comes from the sequencer state rather than from HEAD, and
+    /// the ahead/behind counts describe a HEAD part-way through the operation.
+    pub op: Option<Op>,
 }
 
 /// Merged-ness is three separate questions and conflating them is how a tool

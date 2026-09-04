@@ -23,6 +23,7 @@ const UPSTREAM_ICON: &str = "\u{f02a2}";
 const PATH_ICON: &str = "\u{f07b}";
 const REVIEW_ICON: &str = "\u{f4a5}";
 const DIRTY_ICON: &str = "\u{f448}";
+const OP_ICON: &str = "\u{f071}";
 
 /// lazygit's colours for the rollup states, so a check reads the same in both
 /// tools: green passing, yellow pending, red failing *and* error, plain for a
@@ -269,6 +270,25 @@ fn draw_workstreams(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(truncate(&w.git.branch, 34), base),
             ]));
 
+            if let Some(op) = &w.git.op {
+                return Row::new(vec![
+                    name_cell,
+                    branch_cell,
+                    pr_cell,
+                    ci_cell,
+                    Cell::from(Line::from(drift(w.git.ahead, w.git.behind))),
+                    Cell::from(Line::from(vec![Span::styled(
+                        format!("{OP_ICON} {}", op.label()),
+                        Style::default().fg(Color::Yellow).bold(),
+                    )])),
+                ])
+                .style(if is_selected {
+                    Style::default().bg(ACCENT)
+                } else {
+                    Style::default()
+                });
+            }
+
             Row::new(vec![
                 name_cell,
                 branch_cell,
@@ -374,6 +394,29 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(Color::Magenta),
         ),
     ]));
+
+    if let Some(op) = &w.git.op {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{OP_ICON}  "), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                op.label(),
+                Style::default().fg(Color::Yellow).bold(),
+            ),
+            Span::styled(
+                "  — HEAD is detached until this finishes".to_string(),
+                Style::default().fg(DIM),
+            ),
+        ]));
+        if op.kind == OpKind::Rebase {
+            lines.push(Line::from(vec![
+                Span::styled("   ", Style::default().fg(DIM)),
+                Span::styled(
+                    "resolve and `git rebase --continue`, or `git rebase --abort`",
+                    Style::default().fg(DIM),
+                ),
+            ]));
+        }
+    }
 
     if w.git.dirty > 0 || w.git.staged > 0 {
         lines.push(Line::from(vec![
