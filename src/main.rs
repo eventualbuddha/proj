@@ -1,4 +1,5 @@
 mod app;
+mod cache;
 mod discover;
 mod git;
 mod link;
@@ -70,11 +71,15 @@ fn main() -> Result<()> {
             }
         }
 
+        // --loading means "draw whatever is on screen now", so it must not wait
+        // for anything; it is how startup latency gets measured.
+        let waiting = !args.iter().any(|a| a == "--loading");
+
         // Wait for the first network refresh too, not just the scan. With a warm
         // cache the render is right either way; with a cold one it would show a
         // dashboard with no PR state at all and no way to tell that apart from
         // there being none.
-        {
+        if waiting {
             let deadline = std::time::Instant::now() + Duration::from_secs(60);
             while app.fetched_at.is_none() && std::time::Instant::now() < deadline {
                 app.drain();
@@ -85,9 +90,12 @@ fn main() -> Result<()> {
         // The event loop asks for the selected row's check contexts every
         // frame; do the same here, or --render shows a menu missing its CI entry
         // and looks like a bug in the menu rather than in the harness.
-        app.request_contexts();
+        if waiting {
+            app.request_contexts();
+        }
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        while std::time::Instant::now() < deadline
+        while waiting
+            && std::time::Instant::now() < deadline
             && app
                 .workstream()
                 .and_then(|w| w.pr.as_ref())
@@ -354,8 +362,8 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Esc => app.pane = Pane::Projects,
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
-        KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right => app.pane = Pane::Workstreams,
-        KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Left => app.pane = Pane::Projects,
+        KeyCode::Tab | KeyCode::Right => app.pane = Pane::Workstreams,
+        KeyCode::BackTab | KeyCode::Left => app.pane = Pane::Projects,
         KeyCode::Char('/') => {
             app.filtering = true;
             app.filter = Some(String::new());
@@ -381,12 +389,31 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         }
 
         // Navigate and launch.
-        KeyCode::Char('g') => {
+        KeyCode::Char('l') => {
             if let Some(p) = require_path(app) {
                 if emit(app, format!("lazygit\t{p}")) {
                     return true;
                 }
             }
+        }
+        KeyCode::Char('g') => open_github_menu(app),
+
+        // Check a review out into a disposable worktree.
+        KeyCode::Char('c') if app.sidebar == app::Sidebar::Reviews => {
+            let Some(r) = app.review() else { return false };
+            let slug: String = r
+                .title
+                .to_lowercase()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect::<String>()
+                .split('-')
+                .filter(|s| !s.is_empty())
+                .take(4)
+                .collect::<Vec<_>>()
+                .join("-");
+            let verb = format!("review-checkout\t{}\t{}", r.number, slug);
+            return emit(app, verb);
         }
         KeyCode::Char('e') => {
             if let Some(p) = require_path(app) {
@@ -405,10 +432,12 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 }
             }
         }
-        KeyCode::Char('p') => {
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            let force = matches!(key.code, KeyCode::Char('P'));
             let remote = app.workstream().map(|w| w.git.remote_branch.clone());
             if let (Some(p), Some(remote)) = (require_path(app), remote) {
-                if emit(app, format!("push\t{p}\t{remote}")) {
+                let verb = if force { "push-force" } else { "push" };
+                if emit(app, format!("{verb}\t{p}\t{remote}")) {
                     return true;
                 }
             }
@@ -546,6 +575,55 @@ fn open_url(app: &mut App) {
     }
 }
 
+/// GitHub actions for the selected workstream.
+fn open_github_menu(app: &mut App) {
+    let Some(w) = app.workstream().cloned() else {
+        app.flash("nothing selected");
+        return;
+    };
+    let items = CopyMenu::github_for(&w);
+    if items.is_empty() {
+        app.flash("no GitHub actions for this row");
+        return;
+    }
+    app.copy_menu = Some(CopyMenu::github(items));
+}
+
+/// Run whichever action the github menu entry names.
+fn run_github(app: &mut App, label: String, value: String) {
+    let (verb, rest) = match value.split_once(':') {
+        Some((v, r)) => (v, r.to_string()),
+        None => {
+            // A url: copy it, since this VM has no browser to open into.
+            match link::copy(&value) {
+                Ok(()) => app.flash(format!("{label} copied")),
+                Err(e) => app.flash(format!("clipboard: {e}")),
+            }
+            return;
+        }
+    };
+
+    match verb {
+        "ready" => {
+            app.action = Some(format!("gh-ready\t{rest}"));
+        }
+        "rerun" => {
+            app.action = Some(format!("gh-rerun\t{rest}"));
+        }
+        "review" | "ready-review" => {
+            let number: u32 = rest.parse().unwrap_or(0);
+            app.copy_menu = Some(CopyMenu::reviewer(format!("{verb}:{rest}")));
+            let tx = app.tx.clone();
+            std::thread::spawn(move || {
+                let list = github::suggested_reviewers(app::OWNER, app::REPO, number)
+                    .unwrap_or_default();
+                let _ = tx.send(app::Msg::Reviewers(list));
+            });
+        }
+        _ => app.flash("unknown action"),
+    }
+}
+
 /// Build the copy menu for the selected row.
 fn open_copy_menu(app: &mut App) {
     if app.sidebar == app::Sidebar::Reviews {
@@ -565,6 +643,36 @@ fn open_copy_menu(app: &mut App) {
 
 /// Copy the highlighted entry and close the menu.
 fn copy_selected(app: &mut App) {
+    let kind = app.copy_menu.as_ref().map(|m| m.kind);
+    if kind == Some(app::MenuKind::Github) {
+        let Some((label, value)) = app
+            .copy_menu
+            .as_ref()
+            .and_then(|m| m.selected())
+            .map(|i| (i.label.clone(), i.action.clone().unwrap_or_else(|| i.value.clone())))
+        else {
+            return;
+        };
+        app.copy_menu = None;
+        run_github(app, label, value);
+        return;
+    }
+    if kind == Some(app::MenuKind::Reviewer) {
+        let login = app
+            .copy_menu
+            .as_ref()
+            .and_then(|m| m.selected())
+            .map(|i| i.value.clone());
+        let pending = app.copy_menu.as_ref().and_then(|m| m.pending.clone());
+        app.copy_menu = None;
+        if let (Some(login), Some(pending)) = (login, pending) {
+            let (verb, number) = pending.split_once(':').unwrap_or(("review", ""));
+            let v = if verb == "ready-review" { "gh-ready-review" } else { "gh-review" };
+            app.action = Some(format!("{v}\t{number}\t{login}"));
+        }
+        return;
+    }
+
     let Some((label, value)) = app
         .copy_menu
         .as_ref()
@@ -913,13 +1021,10 @@ mod copy_tests {
         // press against one. The first version of this test asserted against a
         // real row and failed for exactly that reason.
         let mut a = loaded();
-        a.copy_menu = Some(CopyMenu {
-            items: vec![
-                app::CopyItem::new("branch", "a/b"),
-                app::CopyItem::new("HEAD", "deadbeef"),
-            ],
-            idx: 0,
-        });
+        a.copy_menu = Some(CopyMenu::copy(vec![
+            app::CopyItem::new("branch", "a/b"),
+            app::CopyItem::new("HEAD", "deadbeef"),
+        ]));
         assert!(!handle_key(&mut a, key('5')));
         assert!(
             a.copy_menu.is_some(),

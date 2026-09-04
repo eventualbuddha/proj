@@ -195,6 +195,26 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
             case push
                 __proj_push "$parts[2]" "$parts[3]"
 
+            case push-force
+                __proj_push "$parts[2]" "$parts[3]" --force
+
+            case gh-ready
+                gh pr ready "$parts[2]" --repo votingworks/vxsuite
+
+            case gh-review
+                gh pr edit "$parts[2]" --repo votingworks/vxsuite --add-reviewer "$parts[3]"
+
+            case gh-ready-review
+                gh pr ready "$parts[2]" --repo votingworks/vxsuite
+                and gh pr edit "$parts[2]" --repo votingworks/vxsuite --add-reviewer "$parts[3]"
+
+            case gh-rerun
+                gh run rerun --repo votingworks/vxsuite --failed 2>/dev/null
+                or echo "proj: no GitHub Actions runs to re-run (CI here is CircleCI)" >&2
+
+            case review-checkout
+                __proj_review_checkout "$parts[2]" "$parts[3]"
+
             case delete
                 __proj_remove "$parts[2]"
                 # The row is gone, so reopening on it would land nowhere.
@@ -218,9 +238,46 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
     end
 end
 
+function __proj_review_checkout --description "Check out PR NUMBER into a review worktree"
+    set -l number "$argv[1]"
+    set -l slug "$argv[2]"
+    set -l root (__proj_root)/review
+    set -l wt_path "$root/$number-$slug"
+
+    if test -e "$wt_path"
+        echo "Worktree already exists at $wt_path"
+        __proj_goto "$wt_path"
+        return $status
+    end
+
+    if not test -f "$root/README.md"
+        mkdir -p "$root"
+        printf '%s\n' '---' 'emoji: "👀"' 'kind: review' 'name: Code review' 'repos: [vxsuite]' '---' '' '# Code review' '' 'Worktrees checked out for review. Disposable.' > "$root/README.md"
+    end
+
+    set -l branch "review/$number"
+    echo "Fetching PR #$number..."
+    git -C (__proj_repo) fetch --quiet origin "+refs/pull/$number/head:refs/heads/$branch"
+    or begin
+        echo "proj: could not fetch PR #$number" >&2
+        return 1
+    end
+
+    git -C (__proj_repo) worktree add "$wt_path" "$branch"
+    or return 1
+
+    __proj_goto "$wt_path"
+    or return 1
+    __proj_build
+end
+
 function __proj_push --description "Push WORKTREE's branch to its remote name, setting upstream"
     set -l wt_path "$argv[1]"
     set -l remote_branch "$argv[2]"
+    set -l force
+    if contains -- --force $argv
+        set force --force-with-lease
+    end
 
     set -l branch (git -C "$wt_path" rev-parse --abbrev-ref HEAD 2>/dev/null)
     if test -z "$branch"; or test "$branch" = HEAD
@@ -233,7 +290,7 @@ function __proj_push --description "Push WORKTREE's branch to its remote name, s
     # `git push` with push.autoSetupRemote would create a same-named remote
     # branch and quietly bypass the whole convention.
     echo "Pushing '$branch' to origin/$remote_branch..."
-    git -C "$wt_path" push origin "$branch:refs/heads/$remote_branch"
+    git -C "$wt_path" push $force origin "$branch:refs/heads/$remote_branch"
     or return 1
 
     git -C "$wt_path" branch -u "origin/$remote_branch" "$branch" >/dev/null 2>&1

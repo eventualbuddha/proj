@@ -43,6 +43,7 @@ pub enum Msg {
     /// and would re-enter the scan handler.
     Merged(Vec<(String, Merged)>),
     Contexts(u32, Vec<Check>),
+    Reviewers(Vec<String>),
 }
 
 /// Where to open, and whether that request is strong enough to move focus.
@@ -63,9 +64,43 @@ pub struct Select {
 /// will guess wrong most of the time -- the path, the branch, the remote branch,
 /// the sha and the PR url are all things you copy out of here, and which one you
 /// want is the whole question. So it asks.
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum MenuKind {
+    Copy,
+    Github,
+    /// Picking a reviewer; `pending` is the action to run once one is chosen.
+    Reviewer,
+}
+
 pub struct CopyMenu {
     pub items: Vec<CopyItem>,
     pub idx: usize,
+    pub kind: MenuKind,
+    pub title: String,
+    pub loading: bool,
+    /// For `Reviewer`: the action verb awaiting a login.
+    pub pending: Option<String>,
+}
+
+impl CopyMenu {
+    pub fn copy(items: Vec<CopyItem>) -> Self {
+        CopyMenu { items, idx: 0, kind: MenuKind::Copy, title: " copy ".into(), loading: false, pending: None }
+    }
+
+    pub fn github(items: Vec<CopyItem>) -> Self {
+        CopyMenu { items, idx: 0, kind: MenuKind::Github, title: " github ".into(), loading: false, pending: None }
+    }
+
+    pub fn reviewer(pending: String) -> Self {
+        CopyMenu {
+            items: Vec::new(),
+            idx: 0,
+            kind: MenuKind::Reviewer,
+            title: " request review from ".into(),
+            loading: true,
+            pending: Some(pending),
+        }
+    }
 }
 
 /// One entry. `note` is an annotation *about* the value rather than part of it
@@ -76,6 +111,8 @@ pub struct CopyItem {
     pub label: String,
     pub value: String,
     pub note: Option<String>,
+    /// Internal token for action menus; `value` stays human-readable.
+    pub action: Option<String>,
 }
 
 impl CopyItem {
@@ -84,7 +121,13 @@ impl CopyItem {
             label: label.into(),
             value: value.into(),
             note: None,
+            action: None,
         }
+    }
+
+    pub fn with_action(mut self, action: impl Into<String>) -> Self {
+        self.action = Some(action.into());
+        self
     }
 
     pub fn with_note(mut self, note: impl Into<String>) -> Self {
@@ -142,7 +185,7 @@ impl CopyMenu {
             items.push(CopyItem::new("PR number", format!("#{}", pr.number)));
         }
 
-        CopyMenu { items, idx: 0 }
+        CopyMenu::copy(items)
     }
 
     /// The same idea for someone else's PR: what you paste while reviewing is
@@ -163,7 +206,46 @@ impl CopyMenu {
             "checkout",
             format!("gh pr checkout {}", r.number),
         ));
-        CopyMenu { items, idx: 0 }
+        CopyMenu::copy(items)
+    }
+
+    /// GitHub actions for a workstream's PR.
+    pub fn github_for(w: &Workstream) -> Vec<CopyItem> {
+        let mut items = Vec::new();
+        let remote = &w.git.remote_branch;
+        items.push(
+            CopyItem::new(
+                "open a PR",
+                format!("https://github.com/votingworks/vxsuite/compare/main...{remote}?expand=1"),
+            )
+            .with_note("copies the compare url"),
+        );
+        if let Some(pr) = &w.pr {
+            let n = pr.number;
+            if pr.state == PrState::Draft {
+                items.push(
+                    CopyItem::new("mark ready", format!("gh pr ready {n}"))
+                        .with_action(format!("ready:{n}")),
+                );
+                items.push(
+                    CopyItem::new("mark ready, request review", format!("gh pr ready {n} && gh pr edit {n} --add-reviewer …"))
+                        .with_action(format!("ready-review:{n}"))
+                        .with_note("asks who"),
+                );
+            } else {
+                items.push(
+                    CopyItem::new("request review", format!("gh pr edit {n} --add-reviewer …"))
+                        .with_action(format!("review:{n}"))
+                        .with_note("asks who"),
+                );
+            }
+            items.push(
+                CopyItem::new("re-run failed checks", format!("gh run rerun --failed ({n})"))
+                    .with_action(format!("rerun:{n}")),
+            );
+            items.push(CopyItem::new("PR url", pr.url.clone()));
+        }
+        items
     }
 
     pub fn selected(&self) -> Option<&CopyItem> {
@@ -285,7 +367,17 @@ impl App {
             action: None,
             quit: false,
         };
-        app.start_scan(true);
+        // Draw last run's state immediately; the scan replaces it when it lands.
+        if let Some(projects) = crate::cache::load() {
+            app.projects = projects;
+            if let Some(c) = github::load_cache(OWNER, REPO) {
+                app.fetched_at = Some(c.fetched_at);
+                github::apply(&mut app.projects, &c);
+                app.reviews = github::to_reviews(&c);
+            }
+            app.loading = false;
+        }
+        app.start_scan(app.projects.is_empty());
         Ok(app)
     }
 
@@ -325,6 +417,7 @@ impl App {
                 github::apply(&mut projects, &cache);
             }
             compute_merged(&mut projects);
+            crate::cache::save(&projects);
             let _ = tx.send(Msg::Scanned(Box::new(projects)));
         });
     }
@@ -488,6 +581,12 @@ impl App {
                 Msg::RefreshFailed(e) => {
                     self.refreshing = false;
                     self.error = Some(e);
+                }
+                Msg::Reviewers(logins) => {
+                    if let Some(m) = &mut self.copy_menu {
+                        m.loading = false;
+                        m.items = logins.into_iter().map(|l| CopyItem::new(l.clone(), l)).collect();
+                    }
                 }
                 Msg::Contexts(number, list) => {
                     self.contexts_inflight.remove(&number);

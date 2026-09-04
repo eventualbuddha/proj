@@ -44,9 +44,13 @@ fn list_query(branches: &[String]) -> (String, Vec<(String, String)>) {
         fields.push(format!(
             r#"  a{n}: pullRequests(first: 5, headRefName: ${var}, orderBy: {{field: CREATED_AT, direction: DESC}}) {{
     nodes {{
-      number title url state isDraft headRefName reviewDecision
+      number title url state isDraft headRefName reviewDecision baseRefName
       author {{ login }}
       headRepositoryOwner {{ login }}
+      reviewRequests(first: 5) {{ nodes {{ requestedReviewer {{
+        ... on User {{ login }} ... on Team {{ slug }}
+      }} }} }}
+      latestReviews(first: 10) {{ nodes {{ author {{ login }} state }} }}
       headRef {{ target {{ ... on Commit {{
         statusCheckRollup {{ state contexts {{ totalCount }} }}
       }} }} }}
@@ -124,7 +128,10 @@ pub struct CachedPr {
     pub author: String,
     pub review_decision: Option<String>,
     pub check_state: String,
-    pub check_total: u32,
+    pub check_total: u32,    #[serde(default)]
+    pub base: String,
+    #[serde(default)]
+    pub reviewers: Vec<(String, String)>,
 }
 
 pub fn now() -> u64 {
@@ -234,6 +241,8 @@ pub fn refresh(owner: &str, name: &str, branches: &[String]) -> Result<Cache> {
                 review_decision: node["reviewDecision"].as_str().map(str::to_string),
                 check_state: rollup["state"].as_str().unwrap_or("NONE").to_string(),
                 check_total: rollup["contexts"]["totalCount"].as_u64().unwrap_or(0) as u32,
+                base: node["baseRefName"].as_str().unwrap_or("main").to_string(),
+                reviewers: parse_reviewers(node),
             });
         }
     }
@@ -253,6 +262,73 @@ pub fn refresh(owner: &str, name: &str, branches: &[String]) -> Result<Cache> {
     };
     save_cache(owner, name, &cache)?;
     Ok(cache)
+}
+
+/// Reviewers GitHub suggests for a PR, plus anyone already requested.
+pub fn suggested_reviewers(owner: &str, name: &str, number: u32) -> Result<Vec<String>> {
+    let q = r#"
+query($o: String!, $n: String!, $p: Int!) {
+  repository(owner: $o, name: $n) {
+    pullRequest(number: $p) {
+      suggestedReviewers { reviewer { login } }
+      reviewRequests(first: 10) { nodes { requestedReviewer {
+        ... on User { login } ... on Team { slug }
+      } } }
+    }
+  }
+}
+"#;
+    let body = gh(&[
+        "api".into(),
+        "graphql".into(),
+        "-f".into(),
+        format!("query={q}"),
+        "-F".into(),
+        format!("o={owner}"),
+        "-F".into(),
+        format!("n={name}"),
+        "-F".into(),
+        format!("p={number}"),
+    ])?;
+    let v: serde_json::Value = serde_json::from_slice(&body)?;
+    let pr = &v["data"]["repository"]["pullRequest"];
+
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |l: &str| {
+        if !l.is_empty() && !out.iter().any(|x| x == l) {
+            out.push(l.to_string());
+        }
+    };
+    for r in pr["suggestedReviewers"].as_array().cloned().unwrap_or_default() {
+        push(r["reviewer"]["login"].as_str().unwrap_or(""));
+    }
+    for r in pr["reviewRequests"]["nodes"].as_array().cloned().unwrap_or_default() {
+        let w = &r["requestedReviewer"];
+        push(w["login"].as_str().or_else(|| w["slug"].as_str()).unwrap_or(""));
+    }
+    Ok(out)
+}
+
+/// Pending review requests first, then anyone who has already responded.
+fn parse_reviewers(node: &serde_json::Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for r in node["reviewRequests"]["nodes"].as_array().cloned().unwrap_or_default() {
+        let who = &r["requestedReviewer"];
+        if let Some(login) = who["login"].as_str().or_else(|| who["slug"].as_str()) {
+            out.push((login.to_string(), "PENDING".to_string()));
+        }
+    }
+    for r in node["latestReviews"]["nodes"].as_array().cloned().unwrap_or_default() {
+        let Some(login) = r["author"]["login"].as_str() else { continue };
+        if out.iter().any(|(l, _)| l == login) {
+            continue;
+        }
+        out.push((
+            login.to_string(),
+            r["state"].as_str().unwrap_or("COMMENTED").to_string(),
+        ));
+    }
+    out
 }
 
 /// Your review queue: three questions, one request.
@@ -523,6 +599,20 @@ pub fn apply(projects: &mut [Project], cache: &Cache) {
                     total: c.check_total,
                     contexts: None,
                 },
+                base: c.base.clone(),
+                reviewers: c
+                    .reviewers
+                    .iter()
+                    .map(|(login, st)| Reviewer {
+                        login: login.clone(),
+                        state: match st.as_str() {
+                            "PENDING" => ReviewerState::Pending,
+                            "APPROVED" => ReviewerState::Approved,
+                            "CHANGES_REQUESTED" => ReviewerState::ChangesRequested,
+                            _ => ReviewerState::Commented,
+                        },
+                    })
+                    .collect(),
             });
         }
     }

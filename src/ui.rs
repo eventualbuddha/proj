@@ -135,6 +135,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         const VALUE_W: usize = 56;
 
         let mut text = vec![Line::from("")];
+        if menu.loading {
+            text.push(Line::from(vec![
+                Span::styled(format!("  {}", spinner()), Style::default().fg(Color::Yellow)),
+                Span::styled("  finding reviewers", Style::default().fg(DIM)),
+            ]));
+        }
         for (i, item) in menu.items.iter().enumerate() {
             let on = i == menu.idx;
             let mut spans = vec![
@@ -184,7 +190,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             Span::styled(" cancel", Style::default().fg(DIM)),
         ]));
         let h = text.len() as u16 + 2;
-        draw_modal_left(f, " copy ", text, 108, h);
+        let title = menu.title.clone();
+        draw_modal_left(f, &title, text, 108, h);
     } else if let Some(c) = &app.confirm {
         let mut text = vec![Line::from("")];
         for line in &c.body {
@@ -207,6 +214,33 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else if app.help {
         draw_help(f);
     }
+}
+
+/// Both sidebar labels in the border, the inactive one dimmed.
+fn sidebar_block(app: &App, focused: bool) -> Block<'static> {
+    let tab = |label: &str, on: bool| {
+        Span::styled(
+            format!(" {label} "),
+            if on {
+                Style::default().fg(ACCENT).bold()
+            } else {
+                Style::default().fg(DIM)
+            },
+        )
+    };
+    let projects = app.sidebar == Sidebar::Projects;
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(if focused {
+            Style::default().fg(ACCENT)
+        } else {
+            Style::default().fg(DIM)
+        })
+        .title(Line::from(vec![
+            tab("Projects", projects),
+            Span::styled("─", Style::default().fg(DIM)),
+            tab("Reviews", !projects),
+        ]))
 }
 
 fn border(title: &str, focused: bool) -> Block<'_> {
@@ -254,7 +288,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
     app.list_state.select(Some(app.project_idx));
     f.render_stateful_widget(
         List::new(rows)
-            .block(border("Projects", app.pane == Pane::Projects))
+            .block(sidebar_block(app, app.pane == Pane::Projects))
             // Background only, no fg: otherwise the selected project's health
             // glyph loses its red/green and every project looks equally fine.
             // Muted when the cursor is elsewhere -- the project stays visible as
@@ -283,7 +317,7 @@ fn draw_reviews(f: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(DIM),
                 )),
             ])
-            .block(border(&title, app.pane == Pane::Projects)),
+            .block(sidebar_block(app, app.pane == Pane::Projects)),
             area,
         );
         return;
@@ -323,7 +357,7 @@ fn draw_reviews(f: &mut Frame, app: &mut App, area: Rect) {
     app.list_state.select(Some(app.review_idx));
     f.render_stateful_widget(
         List::new(rows)
-            .block(border(&title, app.pane == Pane::Projects))
+            .block(sidebar_block(app, app.pane == Pane::Projects))
             .highlight_style(Style::default().bg(ACCENT)),
         area,
         &mut app.list_state,
@@ -474,6 +508,9 @@ fn draw_workstreams(f: &mut Frame, app: &mut App, area: Rect) {
 
             let flags = {
                 let mut s = String::new();
+                if w.pr.as_ref().is_some_and(|p| p.base != "main" && !p.base.is_empty()) {
+                    s.push_str("󰡱 stacked ");
+                }
                 if w.merged.is_merged() {
                     s.push_str(w.merged.label());
                     s.push(' ');
@@ -678,10 +715,19 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled("   ", Style::default().fg(DIM)),
                 Span::styled(pr.url.clone(), Style::default().fg(Color::Blue).underlined()),
             ]));
-            if let Some(rd) = &pr.review_decision {
+            let who = reviewer_spans(&pr.reviewers, pr.review_decision.as_deref());
+            if !who.is_empty() {
+                let mut l = vec![Span::styled(format!("{REVIEW_ICON}  "), Style::default().fg(DIM))];
+                l.extend(who);
+                lines.push(Line::from(l));
+            }
+            if pr.base != "main" && !pr.base.is_empty() {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{REVIEW_ICON}  "), Style::default().fg(DIM)),
-                    Span::raw(rd.replace('_', " ").to_lowercase()),
+                    Span::styled("   ", Style::default().fg(DIM)),
+                    Span::styled(
+                        format!("stacked on {}", pr.base.trim_start_matches("brian/")),
+                        Style::default().fg(Color::Magenta),
+                    ),
                 ]));
             }
             lines.push(Line::from(vec![
@@ -723,6 +769,36 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+/// Who is reviewing, and what they said.
+fn reviewer_spans(reviewers: &[Reviewer], decision: Option<&str>) -> Vec<Span<'static>> {
+    if reviewers.is_empty() {
+        return match decision {
+            Some("REVIEW_REQUIRED") => vec![Span::styled(
+                "no reviewer yet".to_string(),
+                Style::default().fg(Color::Yellow),
+            )],
+            _ => Vec::new(),
+        };
+    }
+    let mut out = Vec::new();
+    for (i, r) in reviewers.iter().enumerate() {
+        if i > 0 {
+            out.push(Span::styled("  ", Style::default()));
+        }
+        let (verb, style) = match r.state {
+            ReviewerState::Pending => ("reviewing", Style::default().fg(Color::Yellow)),
+            ReviewerState::Approved => ("approved", Style::default().fg(Color::Green)),
+            ReviewerState::ChangesRequested => {
+                ("wants changes", Style::default().fg(Color::Red))
+            }
+            ReviewerState::Commented => ("commented", Style::default().fg(DIM)),
+        };
+        out.push(Span::styled(format!("@{} ", r.login), Style::default()));
+        out.push(Span::styled(verb.to_string(), style));
+    }
+    out
+}
+
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     if app.filtering {
         f.render_widget(
@@ -745,8 +821,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" cd/create  ", Style::default().fg(DIM)),
         Span::styled("/", Style::default().fg(ACCENT)),
         Span::styled(" filter  ", Style::default().fg(DIM)),
-        Span::styled("g", Style::default().fg(ACCENT)),
+        Span::styled("l", Style::default().fg(ACCENT)),
         Span::styled(" lazygit  ", Style::default().fg(DIM)),
+        Span::styled("g", Style::default().fg(ACCENT)),
+        Span::styled(" github  ", Style::default().fg(DIM)),
         Span::styled("b", Style::default().fg(ACCENT)),
         Span::styled(" rebase  ", Style::default().fg(DIM)),
         Span::styled("p", Style::default().fg(ACCENT)),
@@ -757,8 +835,6 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" notes  ", Style::default().fg(DIM)),
         Span::styled("?", Style::default().fg(ACCENT)),
         Span::styled(" help  ", Style::default().fg(DIM)),
-        Span::styled("[ ]", Style::default().fg(ACCENT)),
-        Span::styled(" reviews  ", Style::default().fg(DIM)),
         Span::styled("q", Style::default().fg(ACCENT)),
         Span::styled(" quit", Style::default().fg(DIM)),
     ];
@@ -833,19 +909,20 @@ fn draw_help(f: &mut Frame) {
         Line::from(Span::styled("proj — read-only view", Style::default().bold())),
         Line::from(""),
         Line::from("  j / k, ↓ / ↑    move within the focused pane"),
-        Line::from("  tab / h / l     switch pane"),
+        Line::from("  tab / ← →       switch pane"),
         Line::from("  [ / ]           switch the sidebar between projects and reviews"),
         Line::from("  ↵               quit and cd to the selected workstream"),
         Line::from("  /               filter projects by name, workstream or branch"),
         Line::from("  esc             step back: workstreams → projects, or clear a filter"),
         Line::from(""),
         Line::from(Span::styled("  acting on the selected workstream", Style::default().bold())),
-        Line::from("  g               lazygit, scoped to its worktree"),
+        Line::from("  l               lazygit, scoped to its worktree"),
+        Line::from("  g               github: diff url, mark ready, request review"),
         Line::from("  e               $EDITOR there"),
         Line::from("  y               copy menu: path, branch, sha, PR url, checks url…"),
         Line::from("  o               open its PR url, or copy it"),
         Line::from("  b               rebase on main, then rebuild"),
-        Line::from("  p               push, to brian/<project>/<workstream>"),
+        Line::from("  p / P           push / force-push with lease"),
         Line::from("  d               delete it, after confirming"),
         Line::from(""),
         Line::from("  r               refresh from GitHub"),

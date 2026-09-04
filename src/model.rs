@@ -88,6 +88,7 @@ pub struct GitState {
 /// ancestry alone reports every merged branch as unmerged -- and squash is the
 /// common case in this repo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
 pub enum Merged {
     #[default]
     No,
@@ -280,6 +281,20 @@ impl Checks {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewerState {
+    Pending,
+    Approved,
+    ChangesRequested,
+    Commented,
+}
+
+#[derive(Debug, Clone)]
+pub struct Reviewer {
+    pub login: String,
+    pub state: ReviewerState,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PrInfo {
     pub number: u32,
@@ -290,6 +305,9 @@ pub struct PrInfo {
     /// GitHub's `reviewDecision`: APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED.
     pub review_decision: Option<String>,
     pub checks: Checks,
+    /// Base branch; anything but `main` means this PR is stacked on another.
+    pub base: String,
+    pub reviewers: Vec<Reviewer>,
 }
 
 #[derive(Debug, Clone)]
