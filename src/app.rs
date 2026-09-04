@@ -64,8 +64,33 @@ pub struct Select {
 /// the sha and the PR url are all things you copy out of here, and which one you
 /// want is the whole question. So it asks.
 pub struct CopyMenu {
-    pub items: Vec<(String, String)>,
+    pub items: Vec<CopyItem>,
     pub idx: usize,
+}
+
+/// One entry. `note` is an annotation *about* the value rather than part of it
+/// -- the CI job a url belongs to, say. It has its own field because the first
+/// version folded it into the label, where it overran the label column and ran
+/// into the value with nothing to say which was which.
+pub struct CopyItem {
+    pub label: String,
+    pub value: String,
+    pub note: Option<String>,
+}
+
+impl CopyItem {
+    pub fn new(label: impl Into<String>, value: impl Into<String>) -> Self {
+        CopyItem {
+            label: label.into(),
+            value: value.into(),
+            note: None,
+        }
+    }
+
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.note = Some(note.into());
+        self
+    }
 }
 
 /// Strip the `ci/circleci: ` prefix every context here carries, so the job name
@@ -79,45 +104,48 @@ impl CopyMenu {
     /// whatever does not apply -- a virtual row has no path, an unpushed branch
     /// no upstream, a workstream without a PR no urls.
     pub fn build(w: &Workstream, project_dir: Option<&std::path::Path>) -> Self {
-        let mut items: Vec<(String, String)> = Vec::new();
+        let mut items: Vec<CopyItem> = Vec::new();
 
         if let Some(p) = &w.path {
-            items.push(("worktree path".into(), p.display().to_string()));
+            items.push(CopyItem::new("worktree path", p.display().to_string()));
         }
-        items.push(("branch".into(), w.git.branch.clone()));
-        items.push(("remote branch".into(), w.git.remote_branch.clone()));
+        items.push(CopyItem::new("branch", w.git.branch.clone()));
+        items.push(CopyItem::new("remote branch", w.git.remote_branch.clone()));
         if !w.git.head.is_empty() {
-            items.push(("HEAD".into(), w.git.head.clone()));
+            items.push(CopyItem::new("HEAD", w.git.head.clone()));
         }
         if let Some(up) = &w.git.upstream {
-            items.push(("upstream".into(), up.clone()));
+            items.push(CopyItem::new("upstream", up.clone()));
         }
         if let Some(pr) = &w.pr {
             if !pr.url.is_empty() {
-                items.push(("PR url".into(), pr.url.clone()));
+                items.push(CopyItem::new("PR url", pr.url.clone()));
             }
-            // The CircleCI job itself. Labelled with the job name, because
-            // "the failing one" and "the first one" are different links and you
-            // should be able to see which you are about to take.
+            // The CircleCI job itself. Which job it is goes in the note, not the
+            // label: "the failing one" and "the first one" are different links,
+            // and you should be able to see which you are taking without it
+            // looking like part of the url.
             if let Some(c) = pr.checks.ci_url() {
                 if !c.url.is_empty() {
-                    let label = if c.failed { "CI (failing)" } else { "CI" };
-                    items.push((format!("{label} {}", short_job(&c.name)), c.url.clone()));
+                    let label = if c.failed { "CI ✗" } else { "CI" };
+                    items.push(
+                        CopyItem::new(label, c.url.clone()).with_note(short_job(&c.name)),
+                    );
                 }
             }
-            items.push(("PR number".into(), format!("#{}", pr.number)));
+            items.push(CopyItem::new("PR number", format!("#{}", pr.number)));
             if !pr.title.is_empty() {
-                items.push(("PR title".into(), pr.title.clone()));
+                items.push(CopyItem::new("PR title", pr.title.clone()));
             }
         }
         if let Some(d) = project_dir {
-            items.push(("project dir".into(), d.display().to_string()));
+            items.push(CopyItem::new("project dir", d.display().to_string()));
         }
 
         CopyMenu { items, idx: 0 }
     }
 
-    pub fn selected(&self) -> Option<&(String, String)> {
+    pub fn selected(&self) -> Option<&CopyItem> {
         self.items.get(self.idx)
     }
 }

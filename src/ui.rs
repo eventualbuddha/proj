@@ -121,15 +121,21 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             7,
         );
     } else if let Some(menu) = &app.copy_menu {
+        // Fixed columns: number, label, value, then the note. The label is
+        // truncated to its column rather than allowed to push the value right,
+        // which is what made "CI (failing) test-apps-admin-frontend" run into
+        // the url with nothing between them to say where one ended.
+        const LABEL_W: usize = 14;
+        const VALUE_W: usize = 56;
+
         let mut text = vec![Line::from("")];
-        for (i, (label, value)) in menu.items.iter().enumerate() {
+        for (i, item) in menu.items.iter().enumerate() {
             let on = i == menu.idx;
-            // The value, not just the label: which of two branch-shaped strings
-            // you meant is decided by seeing them, and the whole reason this
-            // menu exists is that the label alone does not tell you.
-            text.push(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
-                    format!(" {} ", i + 1),
+                    // Right-aligned to two columns: " 9 " and " 10 " are
+                    // different widths and shifted every column after them.
+                    format!(" {:>2} ", if i == 9 { 0 } else { i + 1 }),
                     if on {
                         Style::default().bg(ACCENT).fg(Color::White)
                     } else {
@@ -137,19 +143,34 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                     },
                 ),
                 Span::styled(
-                    format!(" {label:<14}"),
+                    format!(" {:<w$}", truncate(&item.label, LABEL_W - 1), w = LABEL_W),
                     if on {
                         Style::default().bold()
                     } else {
                         Style::default()
                     },
                 ),
-                Span::styled(truncate(value, 52), Style::default().fg(DIM)),
-            ]));
+                // The value, not just the label: which of two branch-shaped
+                // strings you meant is decided by seeing them, and the whole
+                // reason this menu exists is that the label alone does not say.
+                Span::styled(
+                    format!("{:<w$}", truncate(&item.value, VALUE_W), w = VALUE_W),
+                    Style::default().fg(DIM),
+                ),
+            ];
+            if let Some(note) = &item.note {
+                // Parenthesised and dim, in its own column: an annotation about
+                // the value, not part of what gets copied.
+                spans.push(Span::styled(
+                    format!(" ({})", truncate(note, 26)),
+                    Style::default().fg(Color::DarkGray).italic(),
+                ));
+            }
+            text.push(Line::from(spans));
         }
         text.push(Line::from(""));
         text.push(Line::from(vec![
-            Span::styled("↵/1-9", Style::default().fg(ACCENT)),
+            Span::styled("↵/digit", Style::default().fg(ACCENT)),
             Span::styled(" copy   ", Style::default().fg(DIM)),
             Span::styled("j/k", Style::default().fg(ACCENT)),
             Span::styled(" move   ", Style::default().fg(DIM)),
@@ -157,7 +178,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             Span::styled(" cancel", Style::default().fg(DIM)),
         ]));
         let h = text.len() as u16 + 2;
-        draw_modal_left(f, " copy ", text, 78, h);
+        draw_modal_left(f, " copy ", text, 108, h);
     } else if let Some(c) = &app.confirm {
         let mut text = vec![Line::from("")];
         for line in &c.body {

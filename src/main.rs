@@ -33,6 +33,7 @@ fn main() -> Result<()> {
         println!("  proj --render     draw one frame to stdout and exit");
         println!("  proj --render --loading   draw the pre-scan frame");
         println!("  proj --render --styles N  dump the resolved fg/bg of row N");
+        println!("  proj --render --press=KEYS  press KEYS first (e.g. --press=y)");
         return Ok(());
     }
 
@@ -66,6 +67,35 @@ fn main() -> Result<()> {
             while app.loading && std::time::Instant::now() < deadline {
                 app.drain();
                 std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        // The event loop asks for the selected row's check contexts every
+        // frame; do the same here, or --render shows a menu missing its CI entry
+        // and looks like a bug in the menu rather than in the harness.
+        app.request_contexts();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline
+            && app
+                .workstream()
+                .and_then(|w| w.pr.as_ref())
+                .is_some_and(|pr| pr.checks.contexts.is_none() && !pr.checks.is_empty())
+        {
+            app.drain();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Drive the real key handler rather than setting state directly, so
+        // what gets drawn is what pressing the key produces.
+        for k in args.iter().filter_map(|a| a.strip_prefix("--press")) {
+            for c in k.trim_start_matches('=').chars() {
+                handle_key(
+                    &mut app,
+                    crossterm::event::KeyEvent::new(
+                        KeyCode::Char(c),
+                        crossterm::event::KeyModifiers::NONE,
+                    ),
+                );
             }
         }
 
@@ -264,9 +294,12 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 }
             }
             // Digits jump straight to an entry and copy it, so the common case
-            // is two keystrokes rather than a scroll.
-            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                let n = c.to_digit(10).unwrap() as usize - 1;
+            // is two keystrokes rather than a scroll. `0` is the tenth, which is
+            // otherwise unreachable by digit and is exactly where the project
+            // directory lands on a row with a PR.
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                let d = c.to_digit(10).unwrap() as usize;
+                let n = if d == 0 { 9 } else { d - 1 };
                 if n < menu.items.len() {
                     menu.idx = n;
                     copy_selected(app);
@@ -484,7 +517,7 @@ fn copy_selected(app: &mut App) {
         .copy_menu
         .as_ref()
         .and_then(|m| m.selected())
-        .cloned()
+        .map(|i| (i.label.clone(), i.value.clone()))
     else {
         app.copy_menu = None;
         return;
@@ -783,7 +816,7 @@ mod copy_tests {
         }
         assert!(!handle_key(&mut a, key('y')));
         let menu = a.copy_menu.as_ref().expect("menu opened");
-        let labels: Vec<&str> = menu.items.iter().map(|(l, _)| l.as_str()).collect();
+        let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
 
         // Branch and remote branch exist for every row, materialized or not.
         assert!(labels.contains(&"branch"));
@@ -799,7 +832,7 @@ mod copy_tests {
         );
 
         // Every entry has something to copy.
-        assert!(menu.items.iter().all(|(_, v)| !v.is_empty()));
+        assert!(menu.items.iter().all(|i| !i.value.is_empty()));
     }
 
     #[test]
@@ -845,8 +878,8 @@ mod copy_tests {
         let mut a = loaded();
         a.copy_menu = Some(CopyMenu {
             items: vec![
-                ("branch".into(), "a/b".into()),
-                ("HEAD".into(), "deadbeef".into()),
+                app::CopyItem::new("branch", "a/b"),
+                app::CopyItem::new("HEAD", "deadbeef"),
             ],
             idx: 0,
         });
