@@ -1137,10 +1137,18 @@ mod github_menu_tests {
     }
 
     #[test]
-    fn a_workstream_with_no_pr_still_offers_the_compare_url() {
+    fn a_workstream_with_no_pr_offers_the_compare_url() {
         let items = CopyMenu::github_for(&ws(None));
         assert_eq!(items.len(), 1);
-        assert!(items[0].action.is_none());
-        assert!(items[0].value.starts_with("https://github.com/"));
+        assert_eq!(items[0].label, "open a PR");
+        assert!(items[0].value.contains("/compare/main..."));
+    }
+
+    #[test]
+    fn a_workstream_with_a_pr_offers_its_url_and_not_a_compare_link() {
+        let items = CopyMenu::github_for(&ws(Some(pr(PrState::Open))));
+        assert_eq!(items[0].label, "PR url");
+        assert!(items.iter().all(|i| !i.value.contains("/compare/")));
+        assert_eq!(items.iter().filter(|i| i.label == "PR url").count(), 1);
     }
 }

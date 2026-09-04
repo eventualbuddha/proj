@@ -213,13 +213,16 @@ impl CopyMenu {
     pub fn github_for(w: &Workstream) -> Vec<CopyItem> {
         let mut items = Vec::new();
         let remote = &w.git.remote_branch;
-        items.push(
-            CopyItem::new(
-                "open a PR",
-                format!("https://github.com/votingworks/vxsuite/compare/main...{remote}?expand=1"),
-            )
-            .with_note("copies the compare url"),
-        );
+        match &w.pr {
+            Some(pr) => items.push(CopyItem::new("PR url", pr.url.clone())),
+            None => items.push(
+                CopyItem::new(
+                    "open a PR",
+                    format!("https://github.com/votingworks/vxsuite/compare/main...{remote}?expand=1"),
+                )
+                .with_note("copies the compare url"),
+            ),
+        }
         if let Some(pr) = &w.pr {
             let n = pr.number;
             if pr.state == PrState::Draft {
@@ -248,7 +251,6 @@ impl CopyMenu {
                     );
                 }
             }
-            items.push(CopyItem::new("PR url", pr.url.clone()));
         }
         items
     }
