@@ -501,14 +501,11 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: ratatui::layout::Rect) -> bo
 
 /// Build the copy menu for the selected row.
 fn open_copy_menu(app: &mut App) {
-    let project_dir = app
-        .project()
-        .and_then(|p| p.readme.parent().map(|d| d.to_path_buf()));
     let Some(w) = app.workstream().cloned() else {
         app.flash("nothing selected");
         return;
     };
-    app.copy_menu = Some(CopyMenu::build(&w, project_dir.as_deref()));
+    app.copy_menu = Some(CopyMenu::build(&w));
 }
 
 /// Copy the highlighted entry and close the menu.

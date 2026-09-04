@@ -103,7 +103,13 @@ impl CopyMenu {
     /// Everything copyable about a workstream, most-wanted first, skipping
     /// whatever does not apply -- a virtual row has no path, an unpushed branch
     /// no upstream, a workstream without a PR no urls.
-    pub fn build(w: &Workstream, project_dir: Option<&std::path::Path>) -> Self {
+    ///
+    /// Deliberately not the PR title or the project directory. Neither is
+    /// something you paste anywhere: the title you read off the row you are
+    /// already looking at, and the project directory is one `cd ..` from the
+    /// worktree path that is already here. A menu earns its length by every
+    /// entry being one you have actually wanted.
+    pub fn build(w: &Workstream) -> Self {
         let mut items: Vec<CopyItem> = Vec::new();
 
         if let Some(p) = &w.path {
@@ -134,12 +140,6 @@ impl CopyMenu {
                 }
             }
             items.push(CopyItem::new("PR number", format!("#{}", pr.number)));
-            if !pr.title.is_empty() {
-                items.push(CopyItem::new("PR title", pr.title.clone()));
-            }
-        }
-        if let Some(d) = project_dir {
-            items.push(CopyItem::new("project dir", d.display().to_string()));
         }
 
         CopyMenu { items, idx: 0 }
