@@ -20,6 +20,17 @@ use crate::model::*;
 pub const OWNER: &str = "votingworks";
 pub const REPO: &str = "vxsuite";
 
+/// How often to re-read the filesystem and git. lazygit refreshes local state
+/// every 10s; this scan is heavier than the one lazygit does on that cadence
+/// (per-branch rev-list, status, and `git cherry` over every row), so it gets a
+/// slightly longer leash.
+const SCAN_INTERVAL: u64 = 15;
+
+/// How often to `git fetch` and re-query GitHub. lazygit's fetchInterval, which
+/// is 60s, for the same reason: it is the network, and nothing on screen changes
+/// faster than a CI run finishes.
+const NETWORK_INTERVAL: u64 = 60;
+
 pub enum Msg {
     /// The filesystem+git scan finished. Carries the whole tree, because the
     /// scan runs off the UI thread and there is nothing useful to show until it
@@ -48,6 +59,13 @@ pub struct App {
     pub fetched_at: Option<u64>,
     pub refreshing: bool,
     pub loading: bool,
+    pub scanning: bool,
+    pub scanned_at: u64,
+    pub network_at: u64,
+    /// Automatic refreshes, toggled with `a`. Worth being able to stop: every
+    /// cycle spawns `git` and `gh`, and there are times you want the numbers to
+    /// hold still while you read them.
+    pub auto: bool,
     /// A short note for the footer, and when it expires.
     pub flash: Option<(String, u64)>,
     /// Row of the detail pane holding the PR url, so a click can find it. Set
@@ -91,6 +109,10 @@ impl App {
             fetched_at: None,
             refreshing: false,
             loading: true,
+            scanning: false,
+            scanned_at: 0,
+            network_at: 0,
+            auto: true,
             flash: None,
             url_row: None,
             contexts_inflight: HashSet::new(),
@@ -105,15 +127,39 @@ impl App {
             action: None,
             quit: false,
         };
-        app.start_scan();
+        app.start_scan(true);
         Ok(app)
+    }
+
+    /// Fire whichever periodic refresh is due. Driven from the event loop's own
+    /// 100ms poll rather than from timer threads: the loop already wakes often
+    /// enough for the spinner, so a second timing mechanism would buy nothing
+    /// and would need waking up.
+    pub fn tick(&mut self) {
+        if !self.auto || self.loading {
+            return;
+        }
+        let now = github::now();
+        if now.saturating_sub(self.scanned_at) >= SCAN_INTERVAL {
+            self.start_scan(false);
+        }
+        if now.saturating_sub(self.network_at) >= NETWORK_INTERVAL {
+            self.start_refresh();
+        }
     }
 
     /// Scan on a thread: filesystem, git, then whatever GitHub state is already
     /// cached, then merged-ness -- in that order, because merged-ness depends on
     /// whether a PR says merged.
-    pub fn start_scan(&mut self) {
-        self.loading = true;
+    /// `show_loading` only on the first scan. A periodic one must not throw a
+    /// modal over a screen you are reading.
+    pub fn start_scan(&mut self, show_loading: bool) {
+        if self.scanning {
+            return;
+        }
+        self.scanning = true;
+        self.loading = show_loading;
+        self.scanned_at = github::now();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let mut projects = discover::scan().unwrap_or_default();
@@ -144,6 +190,7 @@ impl App {
             return;
         }
         self.refreshing = true;
+        self.network_at = github::now();
         self.error = None;
         // Ask only about the branches that exist here. Remote names, because
         // that is the only name GitHub knows them by.
@@ -155,6 +202,10 @@ impl App {
             .collect();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
+            // Fetch first, so "behind main" and the remote-tracking refs are as
+            // current as the PR state landing beside them. Failure is not fatal:
+            // offline, the local answer is still worth showing.
+            let _ = git::fetch_prune(&discover::repo_path());
             let msg = match github::refresh(OWNER, REPO, &branches) {
                 Ok(cache) => Msg::Refreshed(Box::new(cache)),
                 Err(e) => Msg::RefreshFailed(format!("{e:#}")),
@@ -192,12 +243,28 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Scanned(projects) => {
+                    let first = self.loading;
+                    // A periodic scan replaces the whole tree, so anything the
+                    // old one had learned and the new one cannot know has to be
+                    // carried across: which row you were on, and the failing
+                    // check names fetched lazily per PR. Without this, the
+                    // selection jumps and the failing list blinks out every 15s.
+                    let selection = self.selection();
+                    let failing = self.failing_by_pr();
+
                     self.projects = *projects;
+                    self.scanning = false;
                     self.loading = false;
+                    self.restore_failing(&failing);
+                    self.restore_selection(selection);
                     self.clamp();
+
                     // The branch list is only known once the scan lands, and the
-                    // query is built from it, so the fetch waits for this.
-                    self.start_refresh();
+                    // query is built from it, so the first fetch waits for this.
+                    // Later ones are on the network timer.
+                    if first {
+                        self.start_refresh();
+                    }
                 }
                 Msg::Refreshed(cache) => {
                     self.refreshing = false;
@@ -373,6 +440,55 @@ pub fn project_health(p: &Project) -> CheckState {
 }
 
 impl App {
+    /// The selected row, by name rather than by index -- a rescan can add or
+    /// remove rows, and an index would then point at something else.
+    fn selection(&self) -> Option<(String, String)> {
+        let p = self.project()?;
+        match p.workstreams.get(self.workstream_idx) {
+            Some(w) => Some((p.slug.clone(), w.name.clone())),
+            None => Some((p.slug.clone(), String::new())),
+        }
+    }
+
+    fn restore_selection(&mut self, sel: Option<(String, String)>) {
+        let Some((project, workstream)) = sel else { return };
+        let visible = self.visible();
+        if let Some(i) = visible
+            .iter()
+            .position(|&i| self.projects[i].slug == project)
+        {
+            self.project_idx = i;
+            if let Some(j) = self.projects[visible[i]]
+                .workstreams
+                .iter()
+                .position(|w| w.name == workstream)
+            {
+                self.workstream_idx = j;
+            }
+        }
+    }
+
+    fn failing_by_pr(&self) -> Vec<(u32, Vec<String>)> {
+        self.projects
+            .iter()
+            .flat_map(|p| p.workstreams.iter())
+            .filter_map(|w| w.pr.as_ref())
+            .filter_map(|pr| pr.checks.failing.clone().map(|f| (pr.number, f)))
+            .collect()
+    }
+
+    fn restore_failing(&mut self, failing: &[(u32, Vec<String>)]) {
+        for p in &mut self.projects {
+            for w in &mut p.workstreams {
+                if let Some(pr) = &mut w.pr {
+                    if let Some((_, f)) = failing.iter().find(|(n, _)| *n == pr.number) {
+                        pr.checks.failing = Some(f.clone());
+                    }
+                }
+            }
+        }
+    }
+
     pub fn flash(&mut self, msg: impl Into<String>) {
         self.flash = Some((msg.into(), github::now() + 4));
     }

@@ -32,6 +32,7 @@ fn main() -> Result<()> {
         println!("  proj --select P   open focused on project P");
         println!("  proj --render     draw one frame to stdout and exit");
         println!("  proj --render --loading   draw the pre-scan frame");
+        println!("  proj --render --styles N  dump the resolved fg/bg of row N");
         return Ok(());
     }
 
@@ -60,6 +61,29 @@ fn main() -> Result<()> {
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))?;
         term.draw(|f| ui::draw(f, &mut app))?;
         let buf = term.backend().buffer();
+
+        // --styles dumps the fg/bg ratatui actually resolved per cell, which is
+        // the only way to see what a highlight style did to a cell that set its
+        // own colours.
+        if args.iter().any(|a| a == "--styles") {
+            let row = args
+                .iter()
+                .position(|a| a == "--styles")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(2);
+            let mut last = String::new();
+            for x in 0..w {
+                let c = &buf[(x, row)];
+                let key = format!("{:?}/{:?}", c.fg, c.bg);
+                if key != last {
+                    println!("col {x:>3}  fg={:<22} bg={:?}", format!("{:?}", c.fg), c.bg);
+                    last = key;
+                }
+            }
+            return Ok(());
+        }
+
         for y in 0..h {
             let mut line = String::new();
             for x in 0..w {
@@ -122,6 +146,7 @@ fn restore() -> Result<()> {
 fn run(term: &mut Terminal, app: &mut App) -> Result<()> {
     loop {
         app.drain();
+        app.tick();
         app.clamp();
         if app.flash.as_ref().is_some_and(|(_, until)| github::now() > *until) {
             app.flash = None;
@@ -196,7 +221,16 @@ fn run(term: &mut Terminal, app: &mut App) -> Result<()> {
             KeyCode::Char('?') => app.help = true,
             KeyCode::Char('o') => open_url(app),
             KeyCode::Char('r') => app.start_refresh(),
-            KeyCode::Char('R') => app.start_scan(),
+            KeyCode::Char('R') => app.start_scan(false),
+            KeyCode::Char('a') => {
+                app.auto = !app.auto;
+                let msg = if app.auto {
+                    "auto-refresh on"
+                } else {
+                    "auto-refresh off"
+                };
+                app.flash(msg);
+            }
             // A materialized row is a cd. A virtual one has nowhere to go yet,
             // so it becomes a request to create it -- handed to the shell, which
             // can show the build and be interrupted.

@@ -140,6 +140,14 @@ pub fn state(dir: &Path, branch: &str, base: &str, materialized: bool) -> GitSta
     st
 }
 
+/// Bring remote-tracking refs up to date and drop the ones whose branches are
+/// gone. Pruning matters as much as fetching here: a branch deleted after its PR
+/// merged otherwise keeps a stale `origin/...` ref, and every count measured
+/// against it stays frozen at whatever it was the day it merged.
+pub fn fetch_prune(repo: &Path) -> Result<()> {
+    run(repo, &["fetch", "--quiet", "--prune", "--all"]).map(|_| ())
+}
+
 /// The name this branch has on the remote.
 ///
 /// Prefer the configured upstream, which is the truth once the branch has been
