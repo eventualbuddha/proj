@@ -772,6 +772,15 @@ impl App {
         }
     }
 
+    /// Apply a selection to whatever is loaded now, holding it for the scan only
+    /// if nothing is.
+    pub fn select_now(&mut self, target: Option<Select>) {
+        match target {
+            Some(t) if !self.projects.is_empty() => self.apply_selection(t),
+            other => self.pending_select = other,
+        }
+    }
+
     /// Land on a project, and on a workstream within it when the name resolves.
     pub fn apply_selection(&mut self, target: Select) {
         let Select {

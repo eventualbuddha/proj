@@ -59,7 +59,7 @@ fn main() -> Result<()> {
     // no longer took.
     if args.iter().any(|a| a == "--render") {
         let mut app = App::new()?;
-        app.pending_select = select_target(&args);
+        app.select_now(select_target(&args));
 
         // --loading draws the pre-scan state, which is otherwise only on screen
         // for the few hundred milliseconds the background scan takes.
@@ -161,7 +161,7 @@ fn main() -> Result<()> {
     // selection cannot be applied yet -- there is nothing to select in -- so it
     // is held until the scan lands.
     let mut app = App::new()?;
-    app.pending_select = select_target(&args);
+    app.select_now(select_target(&args));
 
     let mut term = setup()?;
     let result = run(&mut term, &mut app);
