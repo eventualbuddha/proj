@@ -208,9 +208,8 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
                 gh pr ready "$parts[2]" --repo votingworks/vxsuite
                 and gh pr edit "$parts[2]" --repo votingworks/vxsuite --add-reviewer "$parts[3]"
 
-            case gh-rerun
-                gh run rerun --repo votingworks/vxsuite --failed 2>/dev/null
-                or echo "proj: no GitHub Actions runs to re-run (CI here is CircleCI)" >&2
+            case ci-rerun
+                __proj_ci_rerun "$parts[2]"
 
             case review-checkout
                 __proj_review_checkout "$parts[2]" "$parts[3]"
@@ -236,6 +235,29 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
 
         set argv $reopen
     end
+end
+
+function __proj_ci_rerun --description "Re-run the failed jobs of the workflow a CircleCI job URL belongs to"
+    set -l url "$argv[1]"
+    set -l job (string match -r '/(\d+)/?$' -- "$url")[2]
+    if test -z "$job"
+        echo "proj: no job number in $url" >&2
+        return 1
+    end
+
+    set -l api https://circleci.com/api
+    set -l workflow (curl -sS --max-time 30 "$api/v1.1/project/github/votingworks/vxsuite/$job" | jq -r '.workflows.workflow_id // empty')
+    if test -z "$workflow"
+        echo "proj: could not resolve job $job to a workflow" >&2
+        return 1
+    end
+
+    echo "Re-running failed jobs in workflow $workflow..."
+    # vmguard injects Circle-Token on this endpoint and validates the body; only
+    # from_failed/jobs/sparse_tree are accepted.
+    curl -sS --max-time 30 -X POST "$api/v2/workflow/$workflow/rerun" \
+        -H 'Content-Type: application/json' \
+        -d '{"from_failed": true}' | jq -r '.message // .'
 end
 
 function __proj_review_checkout --description "Check out PR NUMBER into a review worktree"

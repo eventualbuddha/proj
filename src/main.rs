@@ -591,6 +591,8 @@ fn open_github_menu(app: &mut App) {
 
 /// Run whichever action the github menu entry names.
 fn run_github(app: &mut App, label: String, value: String) {
+    // `rerun:` carries a url, which has colons of its own, so the split takes
+    // only the first.
     let (verb, rest) = match value.split_once(':') {
         Some((v, r)) => (v, r.to_string()),
         None => {
@@ -608,7 +610,7 @@ fn run_github(app: &mut App, label: String, value: String) {
             app.action = Some(format!("gh-ready\t{rest}"));
         }
         "rerun" => {
-            app.action = Some(format!("gh-rerun\t{rest}"));
+            app.action = Some(format!("ci-rerun\t{rest}"));
         }
         "review" | "ready-review" => {
             let number: u32 = rest.parse().unwrap_or(0);

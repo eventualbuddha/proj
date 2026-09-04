@@ -239,10 +239,15 @@ impl CopyMenu {
                         .with_note("asks who"),
                 );
             }
-            items.push(
-                CopyItem::new("re-run failed checks", format!("gh run rerun --failed ({n})"))
-                    .with_action(format!("rerun:{n}")),
-            );
+            if pr.checks.state == CheckState::Failure {
+                if let Some(c) = pr.checks.ci_url() {
+                    items.push(
+                        CopyItem::new("re-run failed jobs", "CircleCI, this workflow".to_string())
+                            .with_action(format!("rerun:{}", c.url))
+                            .with_note(short_job(&c.name)),
+                    );
+                }
+            }
             items.push(CopyItem::new("PR url", pr.url.clone()));
         }
         items
