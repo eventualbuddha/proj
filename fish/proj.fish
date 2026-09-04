@@ -140,6 +140,11 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
             end
         end
 
+        # Whether to pause before the full-screen redraw. A full-screen program
+        # already owned the terminal and left nothing to read; a build, a rebase
+        # or a push leaves output that the next frame would wipe.
+        set -l pause 1
+
         switch $parts[1]
             case cd
                 __proj_goto "$parts[2]"
@@ -151,9 +156,11 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
 
             case edit
                 $EDITOR "$parts[2]"
+                set pause 0
 
             case lazygit
                 lazygit --path "$parts[2]"
+                set pause 0
 
             case rebase
                 __proj_rebase_and_build "$parts[2]"
@@ -171,12 +178,14 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
                 return 1
         end
 
-        # A pause before the full-screen redraw, so whatever just scrolled past
-        # -- a rebase conflict, a push URL, a failed build -- can actually be
-        # read rather than being wiped by the next frame.
-        echo ""
-        read -P "Press enter to return to proj (or ctrl-c to stay here) " -l _
-        or return 0
+        # `_` is read-only in fish -- it holds the name of the running command --
+        # so it cannot be a `read` target, and naming it that made this line
+        # fail every time it was reached.
+        if test $pause -eq 1
+            echo ""
+            read -P "Press enter to return to proj (or ctrl-d to stay here) " -l __proj_ack
+            or return 0
+        end
 
         set argv $reopen
     end
