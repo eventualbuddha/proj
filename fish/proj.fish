@@ -154,8 +154,11 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
                 return $status
 
             case new
+                # Like `cd`: creating a worktree ends with you standing in it,
+                # so the shell is the destination, not a detour.
                 echo "Creating worktree for '$parts[2]' on branch '$parts[3]'..."
                 __proj_new "$parts[2]" --branch-name "$parts[3]"
+                return $status
 
             case edit
                 # cd in, rather than passing the path as an argument. An editor
@@ -213,6 +216,7 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
 
             case review-checkout
                 __proj_review_checkout "$parts[2]" "$parts[3]"
+                return $status
 
             case delete
                 __proj_remove "$parts[2]"
