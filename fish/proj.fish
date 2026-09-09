@@ -80,7 +80,9 @@ function __proj_help
     echo "                                          Runs pnpm install and pnpm build"
     echo "                                          With --rebase, rebase on main before building"
     echo "  rm|remove [<project>/<workstream>]      Remove a workstream (defaults to the current one)"
-    echo "                                          Fails on uncommitted or unpushed commits"
+    echo "                                          Fails on uncommitted changes, or on commits that are"
+    echo "                                          neither in main (by patch-id, so squash merges count)"
+    echo "                                          nor on a remote"
     echo "                                          Also deletes the associated branch"
     echo "  cd [<project>[/<workstream>]]           cd to a project or workstream"
     echo "                                            cd              -> ~/projects"
@@ -156,8 +158,18 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
             case new
                 # Like `cd`: creating a worktree ends with you standing in it,
                 # so the shell is the destination, not a detour.
-                echo "Creating worktree for '$parts[2]' on branch '$parts[3]'..."
-                __proj_new "$parts[2]" --branch-name "$parts[3]"
+                #
+                # A fourth field is a base to branch from, which only a
+                # workstream invented in the dashboard has: materializing a
+                # virtual row takes the branch that already exists.
+                set -l base
+                if test (count $parts) -ge 4; and test -n "$parts[4]"
+                    set base --branch "$parts[4]"
+                    echo "Creating worktree for '$parts[2]' on branch '$parts[3]' from '$parts[4]'..."
+                else
+                    echo "Creating worktree for '$parts[2]' on branch '$parts[3]'..."
+                end
+                __proj_new "$parts[2]" --branch-name "$parts[3]" $base
                 return $status
 
             case edit
@@ -218,6 +230,10 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
                 __proj_review_checkout "$parts[2]" "$parts[3]"
                 return $status
 
+            case review-update
+                __proj_review_update "$parts[2]" "$parts[3]"
+                return $status
+
             case delete
                 __proj_remove "$parts[2]"
                 # The row is gone, so reopening on it would land nowhere.
@@ -264,11 +280,14 @@ function __proj_ci_rerun --description "Re-run the failed jobs of the workflow a
         -d '{"from_failed": true}' | jq -r '.message // .'
 end
 
-function __proj_review_checkout --description "Check out PR NUMBER into a review worktree"
+function __proj_review_checkout --description "Check out PR NUMBER into the review worktree named DIR"
     set -l number "$argv[1]"
-    set -l slug "$argv[2]"
+    # The whole directory name, number and all, decided by the dashboard: it is
+    # the PR number in that name that lets a later run pair the worktree back up
+    # with the review, so the two must agree on it.
+    set -l name "$argv[2]"
     set -l root (__proj_root)/review
-    set -l wt_path "$root/$number-$slug"
+    set -l wt_path "$root/$name"
 
     if test -e "$wt_path"
         echo "Worktree already exists at $wt_path"
@@ -294,6 +313,36 @@ function __proj_review_checkout --description "Check out PR NUMBER into a review
 
     __proj_goto "$wt_path"
     or return 1
+    __proj_build
+end
+
+function __proj_review_update --description "Fast-forward the review worktree at PATH to PR NUMBER's head, then build"
+    set -l wt_path "$argv[1]"
+    set -l number "$argv[2]"
+
+    __proj_goto "$wt_path"
+    or return 1
+
+    # Fetched here rather than in the canonical clone: the branch is checked out
+    # in this worktree, and git refuses to fetch straight into a ref that is.
+    echo "Fetching PR #$number..."
+    git fetch --quiet origin "refs/pull/$number/head"
+    or begin
+        echo "proj: could not fetch PR #$number" >&2
+        return 1
+    end
+
+    # Fast-forward only. A review checkout holds nothing of yours, so anything
+    # that is not a fast-forward means the author rebased or force-pushed -- and
+    # the honest answer there is to say so and let the checkout be deleted and
+    # taken again, not to reset a worktree out from under you.
+    git merge --ff-only FETCH_HEAD
+    or begin
+        echo "" >&2
+        echo "proj: #$number was rewritten; delete this checkout (d) and take it again" >&2
+        return 1
+    end
+
     __proj_build
 end
 
@@ -724,6 +773,30 @@ function __proj_new
     echo "Workstream '$project/$workstream' ready at $wt_path"
 end
 
+function __proj_stranded_commits --description "Commits on WORKTREE's HEAD that exist neither in main nor on its remote"
+    set -l wt_path "$argv[1]"
+
+    set -l main (__proj_remote_ref main)
+    test -n "$main"; or set main main
+
+    # Patch-ids, not ancestry. A squash merge rewrites the history, so every
+    # commit of a merged branch has a different sha and the same patch -- and
+    # `git cherry` is the only question that gets that right.
+    set -l out (git -C "$wt_path" cherry "$main" HEAD 2>/dev/null)
+    or return 0
+
+    for line in $out
+        set -l sha (string replace -rf '^\+ ' '' -- "$line")
+        or continue
+        # Still reachable from the remote-tracking ref, so removing the worktree
+        # loses nothing.
+        if git -C "$wt_path" merge-base --is-ancestor "$sha" '@{upstream}' 2>/dev/null
+            continue
+        end
+        echo "$sha"
+    end
+end
+
 function __proj_remove
     set -l force 0
     set -l target ""
@@ -778,19 +851,19 @@ function __proj_remove
             return 1
         end
 
-        # Unpushed commits. Fall back to the default branch when there is no
-        # upstream, so an unpushed branch is not silently dropped.
+        # Commits that exist nowhere but here. A review checkout has none by
+        # definition: every commit in it came from `refs/pull/<n>/head`, which
+        # GitHub keeps for good, and none of them are yours. The check would
+        # otherwise refuse every one of these -- the branch has no upstream, so
+        # `git cherry` calls the whole PR stranded.
         if test -n "$branch"; and test "$branch" != HEAD
-            set -l base '@{upstream}'
-            if not git -C "$wt_path" rev-parse --verify --quiet '@{upstream}' >/dev/null 2>&1
-                set base (__proj_remote_ref main)
-                test -n "$base"; or set base main
-            end
-
-            set -l unpushed (git -C "$wt_path" log --oneline "$base..HEAD" 2>/dev/null)
-            if test -n "$unpushed"
-                echo "proj rm: '$branch' has commits not in $base:" >&2
-                git -C "$wt_path" log --oneline "$base..HEAD" >&2
+            and test (__proj_meta "$project" kind) != review
+            set -l stranded (__proj_stranded_commits "$wt_path")
+            if test -n "$stranded"
+                echo "proj rm: '$branch' has commits that are neither in main nor on a remote:" >&2
+                for sha in $stranded
+                    git -C "$wt_path" log --oneline -1 $sha >&2
+                end
                 echo "" >&2
                 echo "Use --force to remove anyway" >&2
                 return 1
@@ -813,13 +886,14 @@ function __proj_remove
     end
 
     if test -n "$branch"; and test "$branch" != HEAD
-        set -l delete_flag -d
-        test $force -eq 0; or set delete_flag -D
-
-        if git -C (__proj_repo) branch $delete_flag "$branch" >/dev/null 2>&1
+        # `-D`, not `-d`, once the checks above found nothing stranded. `-d`
+        # asks about ancestry, and a squash-merged branch is not an ancestor of
+        # main -- so the branch this most wants to delete is exactly the one it
+        # would otherwise keep forever.
+        if git -C (__proj_repo) branch -D "$branch" >/dev/null 2>&1
             echo "Deleted branch '$branch'"
         else
-            echo "Kept branch '$branch' (not fully merged; delete with: git -C "(__proj_repo)" branch -D $branch)"
+            echo "Kept branch '$branch' (delete it with: git -C "(__proj_repo)" branch -D $branch)"
         end
     end
 

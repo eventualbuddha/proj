@@ -70,6 +70,11 @@ fn pr_badge(pr: &PrInfo) -> Vec<Span<'static>> {
     ]
 }
 
+/// Lines per row in the review queue: the number, the title, the author. Mouse
+/// hit-testing needs it, so it lives next to `regions` rather than inside the
+/// list that draws them.
+pub const REVIEW_ROW_LINES: u16 = 3;
+
 /// Where each pane sits. A pure function of the frame, shared by the renderer
 /// and by mouse hit-testing so the two cannot drift apart.
 pub struct Regions {
@@ -126,6 +131,73 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             44,
             7,
         );
+    } else if let Some(n) = &app.new_ws {
+        let mut text = vec![Line::from("")];
+        // The name stays on screen while the base is being picked: it is what
+        // the branch about to be created is named after, and it goes away the
+        // moment you can no longer edit it otherwise.
+        text.push(Line::from(vec![
+            Span::styled("    name  ", Style::default().fg(DIM)),
+            Span::styled(n.name.clone(), Style::default().bold()),
+            if n.picking_base {
+                Span::raw("")
+            } else {
+                Span::styled("▏", Style::default().fg(ACCENT))
+            },
+        ]));
+        text.push(Line::from(vec![
+            Span::styled("  branch  ", Style::default().fg(DIM)),
+            Span::styled(
+                if n.name.trim().is_empty() {
+                    format!("{}/…", n.project)
+                } else {
+                    n.branch()
+                },
+                Style::default().fg(DIM),
+            ),
+        ]));
+        text.push(Line::from(""));
+
+        if n.picking_base {
+            text.push(Line::from(Span::styled(
+                "  branch from",
+                Style::default().bold(),
+            )));
+            for (i, b) in n.bases.iter().enumerate() {
+                let on = i == n.base_idx;
+                text.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {:<24}", truncate(&b.label, 23)),
+                        if on {
+                            Style::default().bg(ACCENT).fg(Color::White).bold()
+                        } else {
+                            Style::default()
+                        },
+                    ),
+                    Span::styled(format!("  {}", truncate(&b.branch, 40)), Style::default().fg(DIM)),
+                ]));
+            }
+            text.push(Line::from(""));
+            text.push(Line::from(vec![
+                Span::styled("  ↵", Style::default().fg(ACCENT)),
+                Span::styled(" create   ", Style::default().fg(DIM)),
+                Span::styled("j/k", Style::default().fg(ACCENT)),
+                Span::styled(" move   ", Style::default().fg(DIM)),
+                Span::styled("esc", Style::default().fg(ACCENT)),
+                Span::styled(" back to the name", Style::default().fg(DIM)),
+            ]));
+        } else {
+            text.push(Line::from(vec![
+                Span::styled("  ↵", Style::default().fg(ACCENT)),
+                Span::styled(" pick a base   ", Style::default().fg(DIM)),
+                Span::styled("esc", Style::default().fg(ACCENT)),
+                Span::styled(" cancel", Style::default().fg(DIM)),
+            ]));
+        }
+
+        let h = (text.len() as u16 + 2).min(f.area().height);
+        let title = format!(" new workstream in {} ", n.project);
+        draw_modal_left(f, &title, text, 74, h);
     } else if let Some(menu) = &app.copy_menu {
         // Fixed columns: number, label, value, then the note. The label is
         // truncated to its column rather than allowed to push the value right,
@@ -327,21 +399,31 @@ fn draw_reviews(f: &mut Frame, app: &mut App, area: Rect) {
         .reviews
         .iter()
         .map(|r| {
+            let mut head = vec![
+                Span::styled(
+                    format!("#{} ", r.number),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(r.checks.state.glyph(), check_style(r.checks.state)),
+                Span::styled(
+                    format!(" {}", r.reason.label()),
+                    Style::default().fg(match r.reason {
+                        ReviewReason::Rereview => Color::Yellow,
+                        _ => DIM,
+                    }),
+                ),
+            ];
+            // Which rows already have a worktree, in the same glyph the
+            // workstreams table uses for the same fact -- it is what tells you
+            // whether ↵ is a cd or a five-minute build.
+            if r.worktree.is_some() {
+                head.push(Span::styled(
+                    format!(" {WORKTREE_ICON}"),
+                    Style::default().fg(Color::Green),
+                ));
+            }
             ListItem::new(vec![
-                Line::from(vec![
-                    Span::styled(
-                        format!("#{} ", r.number),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                    Span::styled(r.checks.state.glyph(), check_style(r.checks.state)),
-                    Span::styled(
-                        format!(" {}", r.reason.label()),
-                        Style::default().fg(match r.reason {
-                            ReviewReason::Rereview => Color::Yellow,
-                            _ => DIM,
-                        }),
-                    ),
-                ]),
+                Line::from(head),
                 Line::from(Span::styled(
                     format!("  {}", truncate(&r.title, 24)),
                     Style::default(),
@@ -407,7 +489,8 @@ fn draw_review_checks(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(border(&title, false)), area);
 }
 
-fn draw_review_detail(f: &mut Frame, app: &App, area: Rect) {
+fn draw_review_detail(f: &mut Frame, app: &mut App, area: Rect) {
+    app.url_row = None;
     let Some(r) = app.review() else {
         f.render_widget(border("Detail", false), area);
         return;
@@ -417,6 +500,8 @@ fn draw_review_detail(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("   ", Style::default().fg(DIM)),
         Span::raw(truncate(&r.title, 84)),
     ])];
+    // +1 for the border, and the url is the line after the title.
+    let url_row = area.y + 2;
     lines.push(Line::from(vec![
         Span::styled("   ", Style::default().fg(DIM)),
         Span::styled(r.url.clone(), Style::default().fg(Color::Blue).underlined()),
@@ -425,6 +510,22 @@ fn draw_review_detail(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(format!("{BRANCH_ICON}  "), Style::default().fg(DIM)),
         Span::raw(r.branch.clone()),
     ]));
+    // Where the checkout is, or what ↵ would do instead. Someone else's PR is
+    // only reviewable once it is on disk, so this is the line the whole pane is
+    // really about.
+    lines.push(match &r.worktree {
+        Some(p) => Line::from(vec![
+            Span::styled(format!("{PATH_ICON}  "), Style::default().fg(DIM)),
+            Span::raw(p.display().to_string()),
+        ]),
+        None => Line::from(vec![
+            Span::styled(format!("{MISSING_WORKTREE_ICON}  "), Style::default().fg(DIM)),
+            Span::styled(
+                "not checked out — ↵ fetches it and builds",
+                Style::default().fg(DIM),
+            ),
+        ]),
+    });
     lines.push(Line::from(vec![
         Span::styled("   ", Style::default().fg(DIM)),
         Span::raw(r.author.clone()),
@@ -457,10 +558,12 @@ fn draw_review_detail(f: &mut Frame, app: &App, area: Rect) {
         ),
     ]));
 
+    let title = format!("#{}", r.number);
     f.render_widget(
-        Paragraph::new(lines).block(border(&format!("#{}", r.number), false)),
+        Paragraph::new(lines).block(border(&title, false)),
         area,
     );
+    app.url_row = Some(url_row);
 }
 
 fn draw_workstreams(f: &mut Frame, app: &mut App, area: Rect) {
@@ -816,28 +919,54 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     // seconds and then never read again, and the footer is narrow enough that
     // every one of them costs a key you might actually have forgotten. They stay
     // in `?`.
-    let mut spans = vec![
-        Span::styled("↵", Style::default().fg(ACCENT)),
-        Span::styled(" cd/create  ", Style::default().fg(DIM)),
-        Span::styled("/", Style::default().fg(ACCENT)),
-        Span::styled(" filter  ", Style::default().fg(DIM)),
-        Span::styled("g", Style::default().fg(ACCENT)),
-        Span::styled(" lazygit  ", Style::default().fg(DIM)),
-        Span::styled("G", Style::default().fg(ACCENT)),
-        Span::styled(" github  ", Style::default().fg(DIM)),
-        Span::styled("b", Style::default().fg(ACCENT)),
-        Span::styled(" rebase  ", Style::default().fg(DIM)),
-        Span::styled("p", Style::default().fg(ACCENT)),
-        Span::styled(" push  ", Style::default().fg(DIM)),
-        Span::styled("y", Style::default().fg(ACCENT)),
-        Span::styled(" copy  ", Style::default().fg(DIM)),
-        Span::styled("o", Style::default().fg(ACCENT)),
-        Span::styled(" notes  ", Style::default().fg(DIM)),
-        Span::styled("?", Style::default().fg(ACCENT)),
-        Span::styled(" help  ", Style::default().fg(DIM)),
-        Span::styled("q", Style::default().fg(ACCENT)),
-        Span::styled(" quit", Style::default().fg(DIM)),
-    ];
+    let key = |k: &str, what: &str| {
+        vec![
+            Span::styled(k.to_string(), Style::default().fg(ACCENT)),
+            Span::styled(format!(" {what}  "), Style::default().fg(DIM)),
+        ]
+    };
+
+    // The review queue's keys are not the same keys. Half of what you do to your
+    // own workstream -- push it, open its notes, start a new one -- means nothing
+    // on someone else's PR, and ↵ leads with what it will actually do to the
+    // selected row.
+    let mut spans: Vec<Span> = if app.sidebar == Sidebar::Reviews {
+        let checked_out = app.review().is_some_and(|r| r.worktree.is_some());
+        [
+            key("↵", if checked_out { "cd" } else { "check out" }),
+            key("c", if checked_out { "update" } else { "check out" }),
+            key("g", "lazygit"),
+            key("G", "github"),
+            key("y", "copy"),
+            key("o", "open PR"),
+            key("d", "delete"),
+            key("[", "projects"),
+            key("?", "help"),
+            vec![
+                Span::styled("q", Style::default().fg(ACCENT)),
+                Span::styled(" quit", Style::default().fg(DIM)),
+            ],
+        ]
+        .concat()
+    } else {
+        [
+            key("↵", "cd/create"),
+            key("n", "new"),
+            key("/", "filter"),
+            key("g", "lazygit"),
+            key("G", "github"),
+            key("b", "rebase"),
+            key("p", "push"),
+            key("y", "copy"),
+            key("o", "notes"),
+            key("?", "help"),
+            vec![
+                Span::styled("q", Style::default().fg(ACCENT)),
+                Span::styled(" quit", Style::default().fg(DIM)),
+            ],
+        ]
+        .concat()
+    };
 
     // Cache age is always on screen. Every number to its left came from GitHub
     // at that moment and not since, and a viewer who cannot see the age has no
@@ -911,7 +1040,8 @@ fn draw_help(f: &mut Frame) {
         Line::from("  j / k, ↓ / ↑    move within the focused pane"),
         Line::from("  tab / h l / ← →  switch pane"),
         Line::from("  [ / ]           switch the sidebar between projects and reviews"),
-        Line::from("  ↵               quit and cd to the selected workstream"),
+        Line::from("  ↵               quit and cd to the selected workstream, creating it first"),
+        Line::from("  n               new workstream: name it, pick what to branch from"),
         Line::from("  /               filter projects by name, workstream or branch"),
         Line::from("  esc             step back: workstreams → projects, or clear a filter"),
         Line::from(""),
@@ -924,6 +1054,13 @@ fn draw_help(f: &mut Frame) {
         Line::from("  b               rebase on main, then rebuild"),
         Line::from("  p / P           push / force-push with lease"),
         Line::from("  d               delete it, after confirming"),
+        Line::from(""),
+        Line::from(Span::styled("  in the review queue", Style::default().bold())),
+        Line::from("  ↵               check the PR out under review/ and build it, or cd there"),
+        Line::from("  c               the author's latest: check out, or fast-forward and rebuild"),
+        Line::from("  g e b           lazygit, $EDITOR, rebase — in the checkout, once it exists"),
+        Line::from("  G y o           github actions, copy menu, open the PR"),
+        Line::from("  d               delete the checkout; it is disposable"),
         Line::from(""),
         Line::from("  r               refresh from GitHub"),
         Line::from("  R               re-scan the filesystem and git now"),

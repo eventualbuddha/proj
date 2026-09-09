@@ -108,13 +108,20 @@ fn main() -> Result<()> {
         // Drive the real key handler rather than setting state directly, so
         // what gets drawn is what pressing the key produces.
         for k in args.iter().filter_map(|a| a.strip_prefix("--press")) {
-            for c in k.trim_start_matches('=').chars() {
+            // `\n` is a literal backslash-n: enter, which the modals that ask
+            // for something need and which no shell will pass as a raw key.
+            let mut chars = k.trim_start_matches('=').chars().peekable();
+            while let Some(c) = chars.next() {
+                let code = match c {
+                    '\\' if chars.peek() == Some(&'n') => {
+                        chars.next();
+                        KeyCode::Enter
+                    }
+                    c => KeyCode::Char(c),
+                };
                 handle_key(
                     &mut app,
-                    crossterm::event::KeyEvent::new(
-                        KeyCode::Char(c),
-                        crossterm::event::KeyModifiers::NONE,
-                    ),
+                    crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
                 );
             }
         }
@@ -299,6 +306,37 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         return false;
     }
 
+    // Naming a new workstream: every key is either text or navigation within
+    // the modal, so nothing below can see them.
+    if let Some(n) = &mut app.new_ws {
+        if n.picking_base {
+            match key.code {
+                // Back to the name rather than out entirely: esc steps back
+                // here as it does everywhere else.
+                KeyCode::Esc => n.picking_base = false,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    n.base_idx = (n.base_idx + 1) % n.bases.len();
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    n.base_idx = (n.base_idx + n.bases.len() - 1) % n.bases.len();
+                }
+                KeyCode::Enter => return create_workstream(app),
+                _ => {}
+            }
+        } else {
+            match key.code {
+                KeyCode::Esc => app.new_ws = None,
+                KeyCode::Backspace => {
+                    n.name.pop();
+                }
+                KeyCode::Enter => app.new_name_done(),
+                KeyCode::Char(c) => n.name.push(c),
+                _ => {}
+            }
+        }
+        return false;
+    }
+
     // The copy menu owns the keyboard while it is open.
     if let Some(menu) = &mut app.copy_menu {
         match key.code {
@@ -374,6 +412,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         // The project's README is where the state of a project actually lives --
         // what is blocked, what the traps are, what to do next. `n` is taken by
         // "new workstream", so `o` it is.
+        KeyCode::Char('o') if app.sidebar == app::Sidebar::Reviews => open_url(app),
         KeyCode::Char('o') => {
             let dir = app
                 .project()
@@ -388,6 +427,10 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             }
         }
 
+        // A workstream that does not exist yet, and so is on no row: the one
+        // thing the dashboard could not reach until now.
+        KeyCode::Char('n') => app.begin_new_workstream(),
+
         // Navigate and launch.
         KeyCode::Char('g') => {
             if let Some(p) = require_path(app) {
@@ -398,22 +441,9 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         }
         KeyCode::Char('G') => open_github_menu(app),
 
-        // Check a review out into a disposable worktree.
+        // The author's latest, whether or not it is on disk yet.
         KeyCode::Char('c') if app.sidebar == app::Sidebar::Reviews => {
-            let Some(r) = app.review() else { return false };
-            let slug: String = r
-                .title
-                .to_lowercase()
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-                .collect::<String>()
-                .split('-')
-                .filter(|s| !s.is_empty())
-                .take(4)
-                .collect::<Vec<_>>()
-                .join("-");
-            let verb = format!("review-checkout\t{}\t{}", r.number, slug);
-            return emit(app, verb);
+            return checkout_review(app);
         }
         KeyCode::Char('e') => {
             if let Some(p) = require_path(app) {
@@ -431,6 +461,12 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                     return true;
                 }
             }
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') if app.sidebar == app::Sidebar::Reviews => {
+            // A review checkout tracks `refs/pull/<n>/head`, which is not a
+            // branch you can push to, and the branch it would push to belongs to
+            // someone else.
+            app.flash("a review checkout has nowhere to push");
         }
         KeyCode::Char('p') | KeyCode::Char('P') => {
             let force = matches!(key.code, KeyCode::Char('P'));
@@ -505,6 +541,33 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: ratatui::layout::Rect) -> bo
         }
 
         MouseEventKind::Down(MouseButton::Left) => {
+            // In the review queue the sidebar is the only list, and its rows are
+            // three lines tall. The checks pane beside it is a read-out with
+            // nothing to select, so a click there is not a focus change.
+            if app.sidebar == app::Sidebar::Reviews {
+                if inside(r.detail) {
+                    if Some(y) == app.url_row {
+                        open_url(app);
+                    }
+                    return false;
+                }
+                if !inside(r.projects) {
+                    return false;
+                }
+                let Some(row) = y.checked_sub(r.projects.y + 1) else {
+                    return false;
+                };
+                let idx = app.list_state.offset() + (row / ui::REVIEW_ROW_LINES) as usize;
+                if idx >= app.reviews.len() {
+                    return false;
+                }
+                // Click to select, click again to open -- the same rule as a
+                // workstream row, and here the second click can start a build.
+                let reselect = app.review_idx == idx;
+                app.review_idx = idx;
+                return reselect && activate(app);
+            }
+
             if inside(r.projects) {
                 // +1 for the block's top border; the list's own offset covers
                 // whatever has scrolled off the top.
@@ -575,13 +638,21 @@ fn open_url(app: &mut App) {
     }
 }
 
-/// GitHub actions for the selected workstream.
+/// GitHub actions for the selected row.
 fn open_github_menu(app: &mut App) {
-    let Some(w) = app.workstream().cloned() else {
-        app.flash("nothing selected");
-        return;
+    let items = if app.sidebar == app::Sidebar::Reviews {
+        let Some(r) = app.review().cloned() else {
+            app.flash("nothing waiting on you");
+            return;
+        };
+        CopyMenu::github_for_review(&r)
+    } else {
+        let Some(w) = app.workstream().cloned() else {
+            app.flash("nothing selected");
+            return;
+        };
+        CopyMenu::github_for(&w)
     };
-    let items = CopyMenu::github_for(&w);
     if items.is_empty() {
         app.flash("no GitHub actions for this row");
         return;
@@ -703,9 +774,23 @@ fn emit(app: &mut App, verb: String) -> bool {
     true
 }
 
-/// The selected workstream's path, or a note in the footer saying why there
+/// The selected row's worktree path, or a note in the footer saying why there
 /// isn't one. Every action below needs a worktree; a virtual row has none.
+///
+/// Reviews go through here too. Once a PR is checked out its worktree is an
+/// ordinary one -- lazygit, `$EDITOR` and a rebase all mean the same thing in it
+/// -- and reading the path off the visible row is what keeps those keys from
+/// acting on whatever the *other* sidebar happens to have selected.
 fn require_path(app: &mut App) -> Option<String> {
+    if app.sidebar == app::Sidebar::Reviews {
+        return match app.review().and_then(|r| r.worktree.clone()) {
+            Some(p) => Some(p.display().to_string()),
+            None => {
+                app.flash("not checked out — ↵ checks it out");
+                None
+            }
+        };
+    }
     match app.workstream().and_then(|w| w.path.clone()) {
         Some(p) => Some(p.display().to_string()),
         None => {
@@ -717,6 +802,9 @@ fn require_path(app: &mut App) -> Option<String> {
 
 /// Turn the selection into the instruction the shell wrapper acts on.
 fn activate(app: &mut App) -> bool {
+    if app.sidebar == app::Sidebar::Reviews {
+        return activate_review(app);
+    }
     let Some(w) = app.workstream() else {
         return false;
     };
@@ -727,12 +815,67 @@ fn activate(app: &mut App) -> bool {
     true
 }
 
+/// A review row is the same gesture as a workstream row: go to the worktree if
+/// it exists, and otherwise make it.
+///
+/// Making it means fetching `refs/pull/<n>/head`, adding a worktree under the
+/// `review` project and building it -- minutes of pnpm output, which is why it
+/// goes out to the shell rather than running here. Afterwards the checkout is a
+/// row in the Projects sidebar like any other, and this key is a plain cd.
+fn activate_review(app: &mut App) -> bool {
+    let Some(r) = app.review() else {
+        app.flash("nothing waiting on you");
+        return false;
+    };
+    let verb = match &r.worktree {
+        Some(p) => format!("cd\t{}", p.display()),
+        None => format!("review-checkout\t{}\t{}", r.number, r.dir_name()),
+    };
+    emit(app, verb)
+}
+
+/// `c`: the author's latest, checking the PR out if it is not on disk and
+/// fast-forwarding the checkout if it is.
+///
+/// ↵ cannot be this. A cd has to stay instant and offline, and `b` -- rebase on
+/// main -- is the wrong move on someone else's branch: what has moved is their
+/// head, not the base.
+fn checkout_review(app: &mut App) -> bool {
+    let Some(r) = app.review() else {
+        app.flash("nothing waiting on you");
+        return false;
+    };
+    let verb = match &r.worktree {
+        Some(p) => format!("review-update\t{}\t{}", p.display(), r.number),
+        None => format!("review-checkout\t{}\t{}", r.number, r.dir_name()),
+    };
+    emit(app, verb)
+}
+
+/// Hand the shell a workstream to create. Same verb as materializing a virtual
+/// row -- the only difference is that this one names a base, because there is no
+/// existing branch to take the answer from.
+fn create_workstream(app: &mut App) -> bool {
+    let Some(n) = &app.new_ws else { return false };
+    let (qualified, branch, base) = (
+        format!("{}/{}", n.project, n.name),
+        n.branch(),
+        n.base().to_string(),
+    );
+    app.new_ws = None;
+    emit(app, format!("new\t{qualified}\t{branch}\t{base}"))
+}
+
 /// Ask before removing a workstream, and say what is at stake.
 ///
-/// `proj rm` refuses on uncommitted or unpushed work anyway, so this is not the
-/// safety net -- it is the part that tells you *which* workstream you are about
-/// to remove, before the shell scrolls past with an answer.
+/// `proj rm` refuses on uncommitted work or on commits that exist nowhere else,
+/// so this is not the safety net -- it is the part that tells you *which*
+/// workstream you are about to remove, before the shell scrolls past with an
+/// answer.
 fn confirm_delete(app: &mut App) {
+    if app.sidebar == app::Sidebar::Reviews {
+        return confirm_delete_review(app);
+    }
     let Some(w) = app.workstream() else { return };
     if w.is_virtual() {
         app.flash("nothing to delete — this branch has no worktree");
@@ -749,14 +892,26 @@ fn confirm_delete(app: &mut App) {
     if w.git.dirty > 0 {
         body.push(format!("{} uncommitted change(s) — proj rm will refuse", w.git.dirty));
     }
-    if w.git.unpushed.is_some_and(|n| n > 0) {
-        body.push(format!(
-            "{} unpushed commit(s) — proj rm will refuse",
-            w.git.unpushed.unwrap()
-        ));
+
+    // Commits that exist nowhere but here. Not the same question as "has an
+    // upstream": a merged branch is deleted on the remote and its tracking ref
+    // pruned, which used to be reported as "never pushed — proj rm will refuse"
+    // on the one row where nothing at all was at risk.
+    if !w.merged.is_merged() {
+        // Both unique to this branch and unpushed. `unpushed` alone counts
+        // main's own commits when the upstream ref is stale -- 45, where three
+        // of them are yours.
+        let stranded = w.git.ahead.min(w.git.unpushed.unwrap_or(u32::MAX));
+        if stranded > 0 {
+            body.push(format!(
+                "{stranded} commit(s) are only here — proj rm will refuse"
+            ));
+        }
     }
-    if w.git.upstream.is_none() {
-        body.push("never pushed — proj rm will refuse".to_string());
+    if !w.git.pushed {
+        body.push("never pushed to a remote".to_string());
+    } else if w.git.upstream.is_none() {
+        body.push(format!("origin/{} is gone", w.git.remote_branch));
     }
 
     app.confirm = Some(Confirm {
@@ -764,6 +919,45 @@ fn confirm_delete(app: &mut App) {
         body,
         verb: format!("delete\t{qualified}"),
     });
+}
+
+/// Ask before throwing away a review checkout.
+///
+/// A review worktree is disposable by design -- it is a copy of someone else's
+/// branch and there is nothing in it to lose -- but "disposable" is not
+/// "nothing", so the confirmation still says which PR is going and `proj rm`
+/// still refuses on uncommitted changes.
+fn confirm_delete_review(app: &mut App) {
+    let Some(r) = app.review() else { return };
+    let Some(path) = &r.worktree else {
+        app.flash("not checked out — nothing to delete");
+        return;
+    };
+    // `proj rm` takes `<project>/<workstream>`, and both halves are right there
+    // in the path -- worth reading off it rather than assuming the review
+    // project is called `review`.
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string());
+    let project = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string());
+    let (Some(name), Some(project)) = (name, project) else {
+        return;
+    };
+    let (number, title) = (r.number, truncate_title(&r.title));
+    app.confirm = Some(Confirm {
+        title: format!(" delete the review checkout of #{number} "),
+        body: vec![title, path.display().to_string()],
+        verb: format!("delete\t{project}/{name}"),
+    });
+}
+
+/// Enough of a PR title to recognise, for a modal that is 64 columns wide.
+fn truncate_title(title: &str) -> String {
+    if title.chars().count() <= 58 {
+        return title.to_string();
+    }
+    format!("{}…", title.chars().take(57).collect::<String>())
 }
 
 fn dump(no_gh: bool) -> Result<()> {
@@ -894,6 +1088,439 @@ mod tests {
         handle_key(&mut a, key('/'));
         assert!(!handle_key(&mut a, key('q')));
         assert_eq!(a.filter.as_deref(), Some("q"));
+    }
+}
+
+/// The review queue's ↵, which is the same gesture as a workstream's and has to
+/// mean the same two things: go there, or make it.
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    use model::*;
+    use std::path::PathBuf;
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+    fn code(c: KeyCode) -> KeyEvent {
+        KeyEvent::new(c, KeyModifiers::NONE)
+    }
+
+    fn review(number: u32, title: &str) -> Review {
+        Review {
+            number,
+            title: title.into(),
+            url: format!("https://github.com/votingworks/vxsuite/pull/{number}"),
+            author: "someone".into(),
+            branch: "someone/fix".into(),
+            state: PrState::Open,
+            checks: Checks::default(),
+            reason: ReviewReason::Requested,
+            updated: 0,
+            worktree: None,
+        }
+    }
+
+    /// A `review` project holding `dirs`, and one review in the queue.
+    fn app(dirs: &[&str], reviews: Vec<Review>) -> App {
+        let mut a = App::new().expect("app");
+        a.loading = false;
+        a.sidebar = app::Sidebar::Reviews;
+        a.projects = vec![Project {
+            slug: "review".into(),
+            emoji: "👀".into(),
+            name: "Code review".into(),
+            kind: ProjectKind::Review,
+            status: "active".into(),
+            readme: PathBuf::from("/tmp/projects/review/README.md"),
+            branch_prefix: None,
+            branch_globs: Vec::new(),
+            workstreams: dirs
+                .iter()
+                .map(|d| Workstream {
+                    project: "review".into(),
+                    name: (*d).into(),
+                    origin: Origin::Worktree,
+                    path: Some(PathBuf::from(format!("/tmp/projects/review/{d}"))),
+                    git: GitState::default(),
+                    merged: Merged::No,
+                    pr: None,
+                })
+                .collect(),
+        }];
+        a.reviews = reviews;
+        a.link_reviews();
+        a
+    }
+
+    #[test]
+    fn enter_on_a_review_with_no_worktree_checks_it_out() {
+        let mut a = app(&[], vec![review(9083, "Fix the scanner status poll")]);
+        assert!(handle_key(&mut a, code(KeyCode::Enter)), "checking out quits");
+        assert_eq!(
+            a.action.as_deref(),
+            Some("review-checkout\t9083\t9083-fix-the-scanner-status")
+        );
+    }
+
+    #[test]
+    fn enter_on_a_checked_out_review_is_a_cd() {
+        let mut a = app(&["9083-fix-the-scanner"], vec![review(9083, "Fix the scanner status poll")]);
+        assert!(handle_key(&mut a, code(KeyCode::Enter)));
+        assert_eq!(
+            a.action.as_deref(),
+            Some("cd\t/tmp/projects/review/9083-fix-the-scanner")
+        );
+    }
+
+    /// The number leads the directory name so that this holds: a PR retitled
+    /// after checkout is still the same checkout.
+    #[test]
+    fn a_retitled_pr_is_not_checked_out_twice() {
+        let a = app(&["9083-old-title-here"], vec![review(9083, "A completely different title")]);
+        assert_eq!(
+            a.review().unwrap().worktree.as_ref().map(|p| p.display().to_string()),
+            Some("/tmp/projects/review/9083-old-title-here".to_string())
+        );
+    }
+
+    #[test]
+    fn a_number_that_only_prefixes_another_is_not_a_match() {
+        let a = app(&["90830-something"], vec![review(9083, "Nine oh eight three")]);
+        assert!(a.review().unwrap().worktree.is_none());
+    }
+
+    #[test]
+    fn c_updates_a_checkout_and_creates_one_that_is_missing() {
+        let mut a = app(&["9083-fix-the-scanner"], vec![review(9083, "Fix it")]);
+        assert!(handle_key(&mut a, key('c')));
+        assert_eq!(
+            a.action.as_deref(),
+            Some("review-update\t/tmp/projects/review/9083-fix-the-scanner\t9083")
+        );
+
+        let mut a = app(&[], vec![review(9083, "Fix it")]);
+        assert!(handle_key(&mut a, key('c')));
+        assert_eq!(a.action.as_deref(), Some("review-checkout\t9083\t9083-fix-it"));
+    }
+
+    /// Every one of these read the *other* sidebar's selection before the queue
+    /// had rows of its own, which is an action on a row you cannot see.
+    #[test]
+    fn worktree_actions_wait_for_the_checkout() {
+        for k in ['g', 'e', 'b', 'd'] {
+            let mut a = app(&[], vec![review(9083, "Fix it")]);
+            assert!(!handle_key(&mut a, key(k)), "{k} should not quit");
+            assert!(a.action.is_none(), "{k} acted on nothing");
+            assert!(a.confirm.is_none(), "{k} offered to delete nothing");
+            assert!(a.flash.is_some(), "{k} should say why");
+        }
+    }
+
+    #[test]
+    fn worktree_actions_land_in_the_checkout() {
+        for (k, verb) in [
+            ('g', "lazygit\t/tmp/projects/review/9083-fix-it"),
+            ('e', "edit\t/tmp/projects/review/9083-fix-it"),
+        ] {
+            let mut a = app(&["9083-fix-it"], vec![review(9083, "Fix it")]);
+            assert!(handle_key(&mut a, key(k)));
+            assert_eq!(a.action.as_deref(), Some(verb));
+        }
+    }
+
+    #[test]
+    fn d_offers_the_checkout_and_not_a_workstream() {
+        let mut a = app(&["9083-fix-it"], vec![review(9083, "Fix it")]);
+        handle_key(&mut a, key('d'));
+        let c = a.confirm.as_ref().expect("a confirmation");
+        assert_eq!(c.verb, "delete\treview/9083-fix-it");
+    }
+
+    #[test]
+    fn there_is_nowhere_to_push_a_review() {
+        let mut a = app(&["9083-fix-it"], vec![review(9083, "Fix it")]);
+        assert!(!handle_key(&mut a, key('p')));
+        assert!(a.action.is_none());
+        assert!(a.flash.is_some());
+    }
+
+    #[test]
+    fn an_empty_queue_swallows_the_key() {
+        let mut a = app(&[], Vec::new());
+        assert!(!handle_key(&mut a, code(KeyCode::Enter)));
+        assert!(a.action.is_none());
+    }
+}
+
+#[cfg(test)]
+mod new_workstream_tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    use model::*;
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+    fn code(c: KeyCode) -> KeyEvent {
+        KeyEvent::new(c, KeyModifiers::NONE)
+    }
+    fn type_in(a: &mut App, s: &str) {
+        for c in s.chars() {
+            handle_key(a, key(c));
+        }
+    }
+
+    /// A two-workstream project and nothing else, so the base list is known.
+    fn app() -> App {
+        let mut a = App::new().expect("app");
+        a.loading = false;
+        a.projects = vec![Project {
+            slug: "react-19".into(),
+            emoji: "⚛️".into(),
+            name: "React 19".into(),
+            kind: ProjectKind::Project,
+            status: "active".into(),
+            readme: std::path::PathBuf::from("/tmp/react-19/README.md"),
+            branch_prefix: None,
+            branch_globs: Vec::new(),
+            workstreams: vec![ws("react-query"), ws("esm-lib")],
+        }];
+        a
+    }
+
+    fn ws(name: &str) -> Workstream {
+        Workstream {
+            project: "react-19".into(),
+            name: name.into(),
+            origin: Origin::Worktree,
+            path: Some(std::path::PathBuf::from(format!("/tmp/react-19/{name}"))),
+            git: GitState {
+                branch: format!("react-19/{name}"),
+                ..Default::default()
+            },
+            merged: Merged::No,
+            pr: None,
+        }
+    }
+
+    #[test]
+    fn n_offers_main_and_the_projects_own_workstreams_as_bases() {
+        let mut a = app();
+        handle_key(&mut a, key('n'));
+        type_in(&mut a, "hooks");
+        handle_key(&mut a, code(KeyCode::Enter));
+        let n = a.new_ws.as_ref().expect("naming");
+        assert!(n.picking_base);
+        let bases: Vec<&str> = n.bases.iter().map(|b| b.branch.as_str()).collect();
+        assert_eq!(bases, ["main", "react-19/react-query", "react-19/esm-lib"]);
+        assert_eq!(n.base(), "main", "main is where the cursor starts");
+    }
+
+    #[test]
+    fn the_verb_carries_the_branch_and_the_chosen_base() {
+        let mut a = app();
+        handle_key(&mut a, key('n'));
+        type_in(&mut a, "hooks");
+        handle_key(&mut a, code(KeyCode::Enter));
+        handle_key(&mut a, key('j'));
+        assert!(handle_key(&mut a, code(KeyCode::Enter)), "creating quits");
+        assert_eq!(
+            a.action.as_deref(),
+            Some("new\treact-19/hooks\treact-19/hooks\treact-19/react-query")
+        );
+    }
+
+    #[test]
+    fn typing_is_typing_and_not_a_keybinding() {
+        let mut a = app();
+        handle_key(&mut a, key('n'));
+        // Every one of these is a command outside the modal.
+        assert!(!handle_key(&mut a, key('q')));
+        type_in(&mut a, "dpj");
+        assert_eq!(a.new_ws.as_ref().unwrap().name, "qdpj");
+        assert!(a.action.is_none() && a.confirm.is_none());
+    }
+
+    #[test]
+    fn esc_steps_back_from_the_base_and_then_out() {
+        let mut a = app();
+        handle_key(&mut a, key('n'));
+        type_in(&mut a, "hooks");
+        handle_key(&mut a, code(KeyCode::Enter));
+        handle_key(&mut a, code(KeyCode::Esc));
+        let n = a.new_ws.as_ref().expect("still naming");
+        assert!(!n.picking_base);
+        assert_eq!(n.name, "hooks", "the name survives the step back");
+        handle_key(&mut a, code(KeyCode::Esc));
+        assert!(a.new_ws.is_none());
+        assert!(a.action.is_none(), "cancelling must not create anything");
+    }
+
+    #[test]
+    fn a_name_that_cannot_be_a_directory_is_refused() {
+        for bad in ["", "feat/hooks", "two words"] {
+            let mut a = app();
+            handle_key(&mut a, key('n'));
+            type_in(&mut a, bad);
+            handle_key(&mut a, code(KeyCode::Enter));
+            assert!(
+                !a.new_ws.as_ref().unwrap().picking_base,
+                "{bad:?} should not have been accepted"
+            );
+            assert!(a.flash.is_some(), "{bad:?} should say why");
+        }
+    }
+
+    #[test]
+    fn a_name_already_in_the_project_is_refused() {
+        let mut a = app();
+        handle_key(&mut a, key('n'));
+        type_in(&mut a, "esm-lib");
+        handle_key(&mut a, code(KeyCode::Enter));
+        assert!(!a.new_ws.as_ref().unwrap().picking_base);
+    }
+
+    #[test]
+    fn backspace_edits_the_name() {
+        let mut a = app();
+        handle_key(&mut a, key('n'));
+        type_in(&mut a, "hooks");
+        handle_key(&mut a, code(KeyCode::Backspace));
+        assert_eq!(a.new_ws.as_ref().unwrap().name, "hook");
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    use model::*;
+
+    fn app(git: GitState, merged: Merged) -> App {
+        let mut a = App::new().expect("app");
+        a.loading = false;
+        a.projects = vec![Project {
+            slug: "backup-restore".into(),
+            emoji: "🔐".into(),
+            name: "Backup & restore".into(),
+            kind: ProjectKind::Project,
+            status: "active".into(),
+            readme: std::path::PathBuf::from("/tmp/backup-restore/README.md"),
+            branch_prefix: None,
+            branch_globs: Vec::new(),
+            workstreams: vec![Workstream {
+                project: "backup-restore".into(),
+                name: "bump-test-timeout".into(),
+                origin: Origin::Worktree,
+                path: Some(std::path::PathBuf::from("/tmp/w")),
+                git,
+                merged,
+                pr: None,
+            }],
+        }];
+        a.pane = Pane::Workstreams;
+        handle_key(&mut a, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        a
+    }
+
+    fn body(a: &App) -> String {
+        a.confirm.as_ref().expect("confirmation").body.join("\n")
+    }
+
+    /// The branch was pushed and merged; the remote deleted it and the prune
+    /// took the tracking ref with it. Nothing here is at risk, and saying
+    /// "never pushed — proj rm will refuse" was both wrong and a refusal.
+    #[test]
+    fn a_merged_branch_whose_remote_is_gone_is_not_called_unpushed() {
+        let a = app(
+            GitState {
+                branch: "backup-restore/bump-test-timeout".into(),
+                remote_branch: "backup-restore/bump-test-timeout".into(),
+                ahead: 1,
+                behind: 1,
+                upstream: None,
+                unpushed: None,
+                pushed: true,
+                ..Default::default()
+            },
+            Merged::Pr,
+        );
+        let body = body(&a);
+        assert!(!body.contains("refuse"), "nothing here is refused: {body}");
+        assert!(!body.contains("never pushed"), "it was pushed: {body}");
+        assert!(body.contains("origin/backup-restore/bump-test-timeout is gone"));
+        assert!(body.contains("merged into main"));
+    }
+
+    #[test]
+    fn commits_that_exist_only_here_are_still_called_out() {
+        let a = app(
+            GitState {
+                branch: "backup-restore/claim-workspace".into(),
+                ahead: 3,
+                upstream: None,
+                unpushed: None,
+                pushed: false,
+                ..Default::default()
+            },
+            Merged::No,
+        );
+        let body = body(&a);
+        assert!(body.contains("3 commit(s) are only here — proj rm will refuse"));
+        assert!(body.contains("never pushed to a remote"));
+        assert!(body.contains("NOT merged into main"));
+    }
+
+    /// `unpushed` counts against the upstream ref, which goes stale: a branch
+    /// three commits ahead of main can be 45 ahead of an upstream that has not
+    /// been updated since main moved.
+    #[test]
+    fn the_stranded_count_is_the_branchs_own_commits_not_the_upstream_drift() {
+        let a = app(
+            GitState {
+                branch: "test-noise/act-checks".into(),
+                ahead: 3,
+                upstream: Some("origin/test-noise-act-checks".into()),
+                unpushed: Some(45),
+                pushed: true,
+                ..Default::default()
+            },
+            Merged::No,
+        );
+        assert!(body(&a).contains("3 commit(s) are only here"));
+    }
+
+    #[test]
+    fn a_fully_pushed_branch_has_nothing_stranded() {
+        let a = app(
+            GitState {
+                branch: "esm-migration/lib-batch-4".into(),
+                ahead: 12,
+                upstream: Some("origin/brian/esm-lib-batch-4".into()),
+                unpushed: Some(0),
+                pushed: true,
+                ..Default::default()
+            },
+            Merged::No,
+        );
+        let body = body(&a);
+        assert!(!body.contains("refuse"), "{body}");
+    }
+
+    #[test]
+    fn uncommitted_changes_are_the_one_thing_that_still_refuses_regardless() {
+        let a = app(
+            GitState {
+                branch: "backup-restore/bump-test-timeout".into(),
+                pushed: true,
+                dirty: 2,
+                ..Default::default()
+            },
+            Merged::Pr,
+        );
+        assert!(body(&a).contains("2 uncommitted change(s) — proj rm will refuse"));
     }
 }
 

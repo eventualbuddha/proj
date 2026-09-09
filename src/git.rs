@@ -191,7 +191,14 @@ pub fn state(dir: &Path, branch: &str, base: &str, materialized: bool) -> GitSta
 
     let upstream_ref = format!("{branch}@{{upstream}}");
     st.upstream = ok(dir, &["rev-parse", "--abbrev-ref", &upstream_ref]);
-    st.remote_branch = remote_name(branch, st.upstream.as_deref());
+    // The configured push target, which outlives the remote-tracking ref: a
+    // merged branch is deleted on the remote, the next prune drops
+    // `origin/<name>`, and `@{upstream}` stops resolving. Reading only that ref
+    // would leave a merged workstream's remote name guessed rather than known,
+    // and the guess misses its PR.
+    let configured = ok(dir, &["config", "--get", &format!("branch.{branch}.merge")]);
+    st.pushed = configured.is_some();
+    st.remote_branch = remote_name(branch, st.upstream.as_deref(), configured.as_deref());
     if let Some(up) = &st.upstream {
         let r = format!("{up}..{branch}");
         st.unpushed = ok(dir, &["rev-list", "--count", &r])
@@ -232,7 +239,14 @@ pub fn fetch_prune(repo: &Path) -> Result<()> {
 /// pushed. Fall back to the convention -- prepend the handle -- so a branch that
 /// has never been pushed still matches a PR if one somehow exists, and so `proj`
 /// can say what it *would* push to.
-pub fn remote_name(branch: &str, upstream: Option<&str>) -> String {
+pub fn remote_name(branch: &str, upstream: Option<&str>, configured: Option<&str>) -> String {
+    // `branch.<name>.merge`, a full ref. Preferred over the tracking ref because
+    // it is still there once the remote branch is gone.
+    if let Some(rest) = configured.and_then(|c| c.strip_prefix("refs/heads/")) {
+        if !rest.is_empty() {
+            return rest.to_string();
+        }
+    }
     if let Some(up) = upstream {
         // "origin/brian/foo/bar" -> "brian/foo/bar". Only the first component is
         // the remote; the rest is the branch, slashes and all.
@@ -256,14 +270,16 @@ pub const HANDLE: &str = "brian/";
 /// it still says yes after a squash merge rewrote the history. A branch whose
 /// commits are all `-` (equivalent found upstream) is in `main`, whatever
 /// ancestry says.
+///
+/// A merged PR is reported as merged only when nothing local contradicts it. It
+/// is the *PR* that merged, not the branch: commits pushed after the merge, or
+/// never pushed at all, sit on the branch with no equivalent in main, and
+/// calling that "merged" is how a delete confirmation ends up vouching for work
+/// that only exists here.
 pub fn merged(dir: &Path, branch: &str, base: &str, pr_merged: bool) -> Merged {
-    if pr_merged {
-        return Merged::Pr;
-    }
-
     let arg = format!("{base}");
     if run(dir, &["merge-base", "--is-ancestor", branch, &arg]).is_ok() {
-        return Merged::Ancestor;
+        return if pr_merged { Merged::Pr } else { Merged::Ancestor };
     }
 
     if let Some(out) = ok(dir, &["cherry", base, branch]) {
@@ -280,9 +296,47 @@ pub fn merged(dir: &Path, branch: &str, base: &str, pr_merged: bool) -> Merged {
             }
         }
         if any {
-            return Merged::Equivalent;
+            // Every commit has an equivalent in main. A squash merge looks
+            // exactly like this, and so does a rebase-and-merge.
+            return if pr_merged { Merged::Pr } else { Merged::Equivalent };
         }
     }
 
-    Merged::No
+    // No local answer -- `cherry` failed, or the branch is unreadable from here.
+    // GitHub's is the only one left.
+    if pr_merged {
+        Merged::Pr
+    } else {
+        Merged::No
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_configured_ref_outranks_the_tracking_ref_and_the_convention() {
+        assert_eq!(
+            remote_name(
+                "backup-restore/bump-test-timeout",
+                None,
+                Some("refs/heads/backup-restore/bump-test-timeout")
+            ),
+            "backup-restore/bump-test-timeout",
+            "a merged branch keeps its config after the tracking ref is pruned"
+        );
+        assert_eq!(
+            remote_name("p/w", Some("origin/brian/p/w"), None),
+            "brian/p/w"
+        );
+    }
+
+    #[test]
+    fn without_either_it_falls_back_to_the_handle() {
+        assert_eq!(remote_name("p/w", None, None), "brian/p/w");
+        assert_eq!(remote_name("brian/p/w", None, None), "brian/p/w");
+        // A config entry that is not a branch ref says nothing useful.
+        assert_eq!(remote_name("p/w", None, Some("refs/heads/")), "brian/p/w");
+    }
 }

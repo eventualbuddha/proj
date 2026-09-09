@@ -33,6 +33,9 @@ pub struct W {
     pub staged: u32,
     pub upstream: Option<String>,
     pub unpushed: Option<u32>,
+    /// Absent from snapshots written before it existed, hence the default.
+    #[serde(default)]
+    pub pushed: bool,
     pub head: String,
     pub merged: u8,
 }
@@ -70,6 +73,7 @@ pub fn save(projects: &[Project]) {
                         staged: w.git.staged,
                         upstream: w.git.upstream.clone(),
                         unpushed: w.git.unpushed,
+                        pushed: w.git.pushed,
                         head: w.git.head.clone(),
                         merged: w.merged as u8,
                     })
@@ -127,6 +131,7 @@ pub fn load() -> Option<Vec<Project>> {
                             staged: w.staged,
                             upstream: w.upstream,
                             unpushed: w.unpushed,
+                            pushed: w.pushed,
                             head: w.head,
                             last_commit: None,
                             op: None,

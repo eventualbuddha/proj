@@ -196,12 +196,20 @@ impl CopyMenu {
             CopyItem::new("PR number", format!("#{}", r.number)),
             CopyItem::new("branch", r.branch.clone()),
         ];
+        // Once it is checked out the path is what you paste at another shell,
+        // and it goes above the CI links for the same reason it is first in
+        // `build`: it is the one you reach for most.
+        if let Some(p) = &r.worktree {
+            items.insert(0, CopyItem::new("worktree path", p.display().to_string()));
+        }
         if let Some(c) = r.checks.ci_url() {
             if !c.url.is_empty() {
                 let label = if c.failed { "CI ✗" } else { "CI" };
                 items.push(CopyItem::new(label, c.url.clone()).with_note(short_job(&c.name)));
             }
         }
+        // The `gh` one-liner stays even with a worktree on disk: it is what you
+        // paste into someone else's terminal, or your own outside ~/projects.
         items.push(CopyItem::new(
             "checkout",
             format!("gh pr checkout {}", r.number),
@@ -255,8 +263,78 @@ impl CopyMenu {
         items
     }
 
+    /// The same menu for someone else's PR. Short by construction: marking
+    /// ready and requesting review are the author's to do, so what is left is
+    /// the url and the one thing a reviewer genuinely needs -- restarting CI
+    /// that fell over on a PR they are trying to read.
+    pub fn github_for_review(r: &Review) -> Vec<CopyItem> {
+        let mut items = vec![CopyItem::new("PR url", r.url.clone())];
+        if r.checks.state == CheckState::Failure {
+            if let Some(c) = r.checks.ci_url() {
+                items.push(
+                    CopyItem::new("re-run failed jobs", "CircleCI, this workflow".to_string())
+                        .with_action(format!("rerun:{}", c.url))
+                        .with_note(short_job(&c.name)),
+                );
+            }
+        }
+        items
+    }
+
     pub fn selected(&self) -> Option<&CopyItem> {
         self.items.get(self.idx)
+    }
+}
+
+/// A base to branch from: `main`, or another workstream in the project.
+pub struct Base {
+    pub label: String,
+    pub branch: String,
+}
+
+/// A workstream being invented. Two stages, because the name has to exist
+/// before there is anything to say "branched from what" about, and because
+/// typing and picking want the same keys.
+pub struct NewWorkstream {
+    pub project: String,
+    pub name: String,
+    pub bases: Vec<Base>,
+    pub base_idx: usize,
+    /// False while typing the name, true once it is picking a base.
+    pub picking_base: bool,
+}
+
+impl NewWorkstream {
+    fn for_project(p: &Project) -> Self {
+        // `main` first: branching from it is the default and the common case,
+        // and stacking on another workstream is the deliberate one.
+        let mut bases = vec![Base {
+            label: "main".into(),
+            branch: "main".into(),
+        }];
+        bases.extend(p.workstreams.iter().map(|w| Base {
+            label: w.name.clone(),
+            branch: w.git.branch.clone(),
+        }));
+        NewWorkstream {
+            project: p.slug.clone(),
+            name: String::new(),
+            bases,
+            base_idx: 0,
+            picking_base: false,
+        }
+    }
+
+    pub fn base(&self) -> &str {
+        self.bases
+            .get(self.base_idx)
+            .map_or("main", |b| b.branch.as_str())
+    }
+
+    /// The branch this will create, by the same rule everything else here
+    /// follows: the path and the branch name say the same thing.
+    pub fn branch(&self) -> String {
+        format!("{}/{}", self.project, self.name.trim())
     }
 }
 
@@ -318,6 +396,8 @@ pub struct App {
     /// A destructive action waiting on a yes. Holds the verb to emit.
     pub confirm: Option<Confirm>,
     pub copy_menu: Option<CopyMenu>,
+    /// A workstream being named, before it exists anywhere.
+    pub new_ws: Option<NewWorkstream>,
     pub filter: Option<String>,
     pub filtering: bool,
     pub tx: Sender<Msg>,
@@ -367,6 +447,7 @@ impl App {
             help: false,
             confirm: None,
             copy_menu: None,
+            new_ws: None,
             filter: None,
             filtering: false,
             tx,
@@ -381,6 +462,7 @@ impl App {
                 app.fetched_at = Some(c.fetched_at);
                 github::apply(&mut app.projects, &c);
                 app.reviews = github::to_reviews(&c);
+                app.link_reviews();
             }
             app.loading = false;
         }
@@ -541,6 +623,10 @@ impl App {
                         None => self.restore_selection(selection),
                     }
                     self.clamp();
+                    // The links point into the tree that was just replaced, and
+                    // a review checked out since the last scan has a worktree
+                    // now that it did not have then.
+                    self.link_reviews();
 
                     // The branch list is only known once the scan lands, and the
                     // query is built from it, so the first fetch waits for this.
@@ -554,6 +640,7 @@ impl App {
                     self.fetched_at = Some(cache.fetched_at);
                     github::apply(&mut self.projects, &cache);
                     self.reviews = github::to_reviews(&cache);
+                    self.link_reviews();
                     // `git cherry` over every row costs a few hundred
                     // milliseconds, so it does not run on the UI thread either.
                     // It answers with pairs rather than a tree -- see Msg::Merged.
@@ -665,6 +752,27 @@ impl App {
 
     pub fn review(&self) -> Option<&Review> {
         self.reviews.get(self.review_idx)
+    }
+
+    /// Pair each review with the worktree it is checked out in, if any.
+    ///
+    /// The two lists meet only here. A review comes from GitHub and a worktree
+    /// from the filesystem, and nothing but the PR number in the directory name
+    /// connects them -- which is why the number leads that name.
+    pub fn link_reviews(&mut self) {
+        let dirs: Vec<(String, PathBuf)> = self
+            .projects
+            .iter()
+            .filter(|p| p.kind == ProjectKind::Review)
+            .flat_map(|p| p.workstreams.iter())
+            .filter_map(|w| w.path.clone().map(|path| (w.name.clone(), path)))
+            .collect();
+        for r in &mut self.reviews {
+            r.worktree = dirs
+                .iter()
+                .find(|(name, _)| r.owns_dir(name))
+                .map(|(_, path)| path.clone());
+        }
     }
 
     /// Cycle the sidebar. Only two lists so far, so both keys are the same move
@@ -848,12 +956,56 @@ impl App {
         }
     }
 
+    /// Start naming a new workstream in the selected project.
+    pub fn begin_new_workstream(&mut self) {
+        if self.sidebar == Sidebar::Reviews {
+            self.flash("switch to projects with [ to add a workstream");
+            return;
+        }
+        match self.project() {
+            Some(p) => self.new_ws = Some(NewWorkstream::for_project(p)),
+            None => self.flash("no project selected"),
+        }
+    }
+
+    /// Accept the typed name and move on to the base, or say why not.
+    ///
+    /// A slash would nest a directory under the project and break the
+    /// path-equals-branch rule the whole layout rests on, so it is rejected
+    /// here rather than turned into something else.
+    pub fn new_name_done(&mut self) {
+        let Some(n) = &self.new_ws else { return };
+        let name = n.name.trim().to_string();
+        if name.is_empty() {
+            self.flash("a workstream needs a name");
+            return;
+        }
+        if name.contains('/') || name.contains(char::is_whitespace) {
+            self.flash("no slashes or spaces in a workstream name");
+            return;
+        }
+        let taken = self
+            .project()
+            .is_some_and(|p| p.workstreams.iter().any(|w| w.name == name));
+        if taken {
+            self.flash(format!("{name} already exists in this project"));
+            return;
+        }
+        if let Some(n) = &mut self.new_ws {
+            n.name = name;
+            n.picking_base = true;
+        }
+    }
+
     pub fn flash(&mut self, msg: impl Into<String>) {
         self.flash = Some((msg.into(), github::now() + 4));
     }
 
     /// The url the selection points at, if any.
     pub fn selected_url(&self) -> Option<String> {
+        if self.sidebar == Sidebar::Reviews {
+            return self.review().map(|r| r.url.clone());
+        }
         self.workstream()?.pr.as_ref().map(|pr| pr.url.clone())
     }
 }

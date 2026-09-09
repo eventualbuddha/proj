@@ -566,6 +566,9 @@ pub fn to_reviews(cache: &Cache) -> Vec<Review> {
                 _ => ReviewReason::Requested,
             },
             updated: r.updated,
+            // Filled in by `App::link_reviews`: the cache knows nothing about
+            // what is on disk.
+            worktree: None,
         })
         .collect()
 }

@@ -74,6 +74,10 @@ pub struct GitState {
     pub remote_branch: String,
     /// Commits not pushed to the upstream. `None` when there is no upstream.
     pub unpushed: Option<u32>,
+    /// Whether this branch has ever had a remote to push to. Distinct from
+    /// `upstream`, which is the remote-tracking ref and disappears the moment
+    /// the branch is deleted on the remote -- which is what merging a PR does.
+    pub pushed: bool,
     /// Unix seconds of the branch tip's commit date.
     pub last_commit: Option<i64>,
     pub head: String,
@@ -384,4 +388,39 @@ pub struct Review {
     pub reason: ReviewReason,
     /// Unix seconds of the head commit, for "how stale is what I am looking at".
     pub updated: i64,
+    /// The worktree this PR is checked out in, when there is one. A review row
+    /// is virtual until then, exactly like a branch with no directory, and ↵
+    /// means the same two things on both: go there, or make it.
+    pub worktree: Option<PathBuf>,
+}
+
+impl Review {
+    /// The directory name a checkout of this PR gets: the number, then enough
+    /// of the title to recognise it by.
+    ///
+    /// The number leads because it is the only stable part -- a PR gets
+    /// retitled, and a worktree found by title alone would then be checked out
+    /// a second time under a new name.
+    pub fn dir_name(&self) -> String {
+        let slug: Vec<String> = self
+            .title
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+            .split('-')
+            .filter(|s| !s.is_empty())
+            .take(4)
+            .map(str::to_string)
+            .collect();
+        format!("{}-{}", self.number, slug.join("-"))
+    }
+
+    /// Does `dir` hold a checkout of this PR?
+    pub fn owns_dir(&self, dir: &str) -> bool {
+        dir == self.number.to_string()
+            || dir
+                .strip_prefix(&format!("{}-", self.number))
+                .is_some_and(|rest| !rest.is_empty())
+    }
 }
