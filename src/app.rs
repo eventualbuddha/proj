@@ -12,9 +12,11 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use ratatui::widgets::{ListState, TableState};
 
+use crate::client;
 use crate::discover;
 use crate::git;
 use crate::github;
+use crate::ipc::Req;
 use crate::model::*;
 
 pub const OWNER: &str = "votingworks";
@@ -44,6 +46,13 @@ pub enum Msg {
     Merged(Vec<(String, Merged)>),
     Contexts(u32, Vec<Check>),
     Reviewers(Vec<String>),
+    /// The daemon connection came up. Until this lands -- and after
+    /// `DaemonLost` -- every fetch below runs in this process instead.
+    Daemon(client::Handle),
+    DaemonLost,
+    /// The daemon started or finished a fetch. The spinner belongs to whoever
+    /// is doing the work, and once there is a daemon that is not us.
+    Fetching(bool),
 }
 
 /// Where to open, and whether that request is strong enough to move focus.
@@ -405,6 +414,13 @@ pub struct App {
     pub filtering: bool,
     pub tx: Sender<Msg>,
     pub rx: Receiver<Msg>,
+    /// The shared fetcher, when one is reachable. `None` means every network
+    /// call happens on this instance's own threads -- correct, just repeated
+    /// once per open window.
+    pub daemon: Option<client::Handle>,
+    /// The branch list the daemon was last told about, so the scan only speaks
+    /// up when it has something new to say.
+    pub sent_branches: Vec<String>,
     /// An instruction for the fish wrapper, written to --cd-file on exit.
     ///
     /// A verb rather than a bare path because a virtual row has nowhere to cd
@@ -456,6 +472,8 @@ impl App {
             filtering: false,
             tx,
             rx,
+            daemon: None,
+            sent_branches: Vec::new(),
             action: None,
             quit: false,
         };
@@ -471,6 +489,7 @@ impl App {
             app.loading = false;
         }
         app.start_scan(app.projects.is_empty());
+        client::connect_async(app.tx.clone());
         Ok(app)
     }
 
@@ -486,7 +505,10 @@ impl App {
         if now.saturating_sub(self.scanned_at) >= SCAN_INTERVAL {
             self.start_scan(false);
         }
-        if now.saturating_sub(self.network_at) >= NETWORK_INTERVAL {
+        // With a daemon the network timer is its timer: it pushes a new cache
+        // when it has one, and a second clock here would only ask the same
+        // question again from a different process.
+        if self.daemon.is_none() && now.saturating_sub(self.network_at) >= NETWORK_INTERVAL {
             self.start_refresh();
         }
     }
@@ -529,6 +551,55 @@ impl App {
         Ok(())
     }
 
+    /// Recompute merged-ness for every row, off the UI thread.
+    ///
+    /// `git cherry` and the whole-branch patch-id behind it cost a few hundred
+    /// milliseconds over every row, so this answers with pairs rather than a
+    /// tree -- see `Msg::Merged`.
+    pub fn start_merged_pass(&mut self) {
+        let rows: Vec<(String, Option<PathBuf>, bool)> = self
+            .projects
+            .iter()
+            .flat_map(|p| p.workstreams.iter())
+            .map(|w| {
+                (
+                    w.git.branch.clone(),
+                    w.path.clone(),
+                    w.pr.as_ref().is_some_and(|pr| pr.state == PrState::Merged),
+                )
+            })
+            .collect();
+        let tx = self.tx.clone();
+        self.merging = true;
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Merged(merged_for(&rows)));
+        });
+    }
+
+    /// The branches this instance wants PR state for. Remote names, because
+    /// that is the only name GitHub knows them by.
+    pub fn branches(&self) -> Vec<String> {
+        self.projects
+            .iter()
+            .flat_map(|p| p.workstreams.iter())
+            .map(|w| w.git.remote_branch.clone())
+            .collect()
+    }
+
+    /// Tell the daemon what this window is looking at, if that has changed.
+    ///
+    /// It queries the union over every instance, so a branch created here has to
+    /// be announced before it can come back with a PR on it.
+    pub fn publish_branches(&mut self) {
+        let Some(d) = &self.daemon else { return };
+        let branches = self.branches();
+        if branches == self.sent_branches {
+            return;
+        }
+        d.send(Req::Branches { branches: branches.clone() });
+        self.sent_branches = branches;
+    }
+
     pub fn start_refresh(&mut self) {
         if self.refreshing {
             return;
@@ -536,14 +607,14 @@ impl App {
         self.refreshing = true;
         self.network_at = github::now();
         self.error = None;
-        // Ask only about the branches that exist here. Remote names, because
-        // that is the only name GitHub knows them by.
-        let branches: Vec<String> = self
-            .projects
-            .iter()
-            .flat_map(|p| p.workstreams.iter())
-            .map(|w| w.git.remote_branch.clone())
-            .collect();
+        if self.daemon.is_some() {
+            self.publish_branches();
+            if let Some(d) = &self.daemon {
+                d.send(Req::Refresh);
+            }
+            return;
+        }
+        let branches = self.branches();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             // Fetch first, so "behind main" and the remote-tracking refs are as
@@ -574,11 +645,7 @@ impl App {
             if !self.contexts_inflight.insert(number) {
                 return;
             }
-            let tx = self.tx.clone();
-            std::thread::spawn(move || {
-                let list = github::contexts(OWNER, REPO, number).unwrap_or_default();
-                let _ = tx.send(Msg::Contexts(number, list));
-            });
+            self.fetch_contexts(number);
             return;
         }
 
@@ -591,6 +658,17 @@ impl App {
         }
         let number = pr.number;
         if !self.contexts_inflight.insert(number) {
+            return;
+        }
+        self.fetch_contexts(number);
+    }
+
+    /// Through the daemon when there is one -- several windows watching the same
+    /// PR then cost one query between them -- and on a thread here when there is
+    /// not.
+    fn fetch_contexts(&self, number: u32) {
+        if let Some(d) = &self.daemon {
+            d.send(Req::Contexts { number });
             return;
         }
         let tx = self.tx.clone();
@@ -641,38 +719,38 @@ impl App {
 
                     // The branch list is only known once the scan lands, and the
                     // query is built from it, so the first fetch waits for this.
-                    // Later ones are on the network timer.
-                    if first {
+                    // Later ones are on the network timer -- or the daemon's,
+                    // which is why it has to be told what this scan found.
+                    self.publish_branches();
+                    // Only the very first launch after a reboot or a rebuild
+                    // gets here with no daemon -- an already-running one is
+                    // connected to in microseconds, long before this scan ends
+                    // -- and on that launch fetching here beats waiting for a
+                    // process that is still starting up.
+                    if first && self.daemon.is_none() {
                         self.start_refresh();
                     }
+                    // The scan may have moved a branch's HEAD, and the carried
+                    // answer is only last scan's. This one is local git, so it
+                    // does not wait for the network.
+                    self.start_merged_pass();
                 }
+                // `a` means "hold the numbers still in this window", and with a
+                // daemon the numbers arrive unbidden -- it is still fetching for
+                // whoever else is watching. Dropping its pushes is what makes
+                // the key keep its meaning. `refreshing` is the exception: it is
+                // only set here by `r`, which is an explicit ask.
+                Msg::Refreshed(_) | Msg::Fetching(_) if !self.auto && !self.refreshing => {}
                 Msg::Refreshed(cache) => {
                     self.refreshing = false;
                     self.fetched_at = Some(cache.fetched_at);
                     github::apply(&mut self.projects, &cache);
                     self.reviews = github::to_reviews(&cache);
                     self.link_reviews();
-                    // `git cherry` over every row costs a few hundred
-                    // milliseconds, so it does not run on the UI thread either.
-                    // It answers with pairs rather than a tree -- see Msg::Merged.
-                    let rows: Vec<(String, Option<PathBuf>, bool)> = self
-                        .projects
-                        .iter()
-                        .flat_map(|p| p.workstreams.iter())
-                        .map(|w| {
-                            (
-                                w.git.branch.clone(),
-                                w.path.clone(),
-                                w.pr.as_ref().is_some_and(|pr| pr.state == PrState::Merged),
-                            )
-                        })
-                        .collect();
-                    let tx = self.tx.clone();
-                    std::thread::spawn(move || {
-                        let _ = tx.send(Msg::Merged(merged_for(&rows)));
-                    });
+                    self.start_merged_pass();
                 }
                 Msg::Merged(pairs) => {
+                    self.merging = false;
                     for (branch, m) in pairs {
                         for p in &mut self.projects {
                             for w in &mut p.workstreams {
@@ -692,6 +770,30 @@ impl App {
                     if let Some(m) = &mut self.copy_menu {
                         m.loading = false;
                         m.items = logins.into_iter().map(|l| CopyItem::new(l.clone(), l)).collect();
+                    }
+                }
+                Msg::Daemon(handle) => {
+                    self.daemon = Some(handle);
+                    // Everything this instance knows about, at once: the daemon
+                    // answers a connection with its cache, and answers a branch
+                    // list it has not seen by fetching.
+                    self.sent_branches.clear();
+                    self.publish_branches();
+                }
+                Msg::DaemonLost => {
+                    self.daemon = None;
+                    self.sent_branches.clear();
+                    self.refreshing = false;
+                    // Requests that went to the daemon will never be answered
+                    // now, and the rows they belong to are still saying
+                    // "loading…". Dropping the guard lets them be asked again,
+                    // this time on our own threads.
+                    self.contexts_inflight.clear();
+                }
+                Msg::Fetching(on) => {
+                    self.refreshing = on;
+                    if on {
+                        self.network_at = github::now();
                     }
                 }
                 Msg::Contexts(number, list) => {

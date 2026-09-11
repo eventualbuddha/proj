@@ -45,6 +45,9 @@ function proj --description "Manage project worktrees under ~/projects"
         case dump
             proj-tui --dump $argv
 
+        case daemon
+            __proj_daemon $argv
+
         case prompt
             __proj_prompt
 
@@ -98,6 +101,7 @@ function __proj_help
     echo "  dump                                    Print the dashboard's state as text"
     echo "  status|st [<project>]                   Show each workstream's branch, drift and dirtiness"
     echo "  prompt                                  Print the prompt segment for \$PWD (used by starship)"
+    echo "  daemon [status|stop]                    The shared fetcher behind every open dashboard"
     echo "  help                                    Show this help"
     echo ""
     echo "Branches are named <project>/<workstream> locally and brian/<project>/<workstream>"
@@ -1065,6 +1069,22 @@ end
 # starship calls that script directly on every prompt -- a fish function would
 # mean spawning fish each time -- so this subcommand exists only so `proj prompt`
 # does what you would expect from the shell.
+
+# The fetcher every dashboard shares. Nobody starts it by hand -- the first
+# `proj` that finds no socket does -- so this is only ever "is it running" and
+# "stop it", which is what you want when a query has gone wrong and you would
+# like the next dashboard to start over.
+function __proj_daemon
+    switch "$argv[1]"
+        case "" status
+            proj-tui --daemon-status
+        case stop
+            proj-tui --daemon-stop
+        case '*'
+            echo "proj daemon: expected status or stop" >&2
+            return 1
+    end
+end
 
 function __proj_prompt --description "Print the prompt segment for the current directory"
     proj-prompt

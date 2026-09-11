@@ -1,13 +1,16 @@
 mod app;
 mod cache;
+mod client;
+mod daemon;
 mod discover;
 mod git;
 mod link;
 mod github;
+mod ipc;
 mod model;
 mod ui;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -33,9 +36,39 @@ fn main() -> Result<()> {
         println!("  proj --cd-file F  write the chosen workstream's path to F on exit");
         println!("  proj --select P[/W]  open focused there; defaults to the cwd");
         println!("  proj --render     draw one frame to stdout and exit");
+        println!("  proj --daemon     run the shared fetcher in the foreground");
+        println!("  proj --daemon-status  what the running daemon is doing");
+        println!("  proj --daemon-stop    ask it to exit now");
         println!("  proj --render --loading   draw the pre-scan frame");
         println!("  proj --render --styles N  dump the resolved fg/bg of row N");
         println!("  proj --render --press=KEYS  press KEYS first (e.g. --press=y)");
+        println!(
+            "  proj --stranded DIR  print DIR's commits that are in neither main nor a remote"
+        );
+        return Ok(());
+    }
+
+    // The shared fetcher. Normally nobody runs this by hand: the first instance
+    // that finds no socket starts one, detached, from this same binary.
+    if args.iter().any(|a| a == "--daemon") {
+        return daemon::run();
+    }
+    if args.iter().any(|a| a == "--daemon-status") {
+        println!("{}", client::status());
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--daemon-stop") {
+        println!("{}", client::stop());
+        return Ok(());
+    }
+
+    // `proj rm` asks this before it removes anything. It is the same answer the
+    // delete confirmation shows, from the same code.
+    if let Some(i) = args.iter().position(|a| a == "--stranded") {
+        let dir = PathBuf::from(args.get(i + 1).context("--stranded needs a directory")?);
+        for sha in git::stranded(&dir, &git::base_ref(&dir)) {
+            println!("{sha}");
+        }
         return Ok(());
     }
 
@@ -692,12 +725,17 @@ fn run_github(app: &mut App, label: String, value: String) {
         "review" | "ready-review" => {
             let number: u32 = rest.parse().unwrap_or(0);
             app.copy_menu = Some(CopyMenu::reviewer(format!("{verb}:{rest}")));
-            let tx = app.tx.clone();
-            std::thread::spawn(move || {
-                let list = github::suggested_reviewers(app::OWNER, app::REPO, number)
-                    .unwrap_or_default();
-                let _ = tx.send(app::Msg::Reviewers(list));
-            });
+            match &app.daemon {
+                Some(d) => d.send(ipc::Req::Reviewers { number }),
+                None => {
+                    let tx = app.tx.clone();
+                    std::thread::spawn(move || {
+                        let list = github::suggested_reviewers(app::OWNER, app::REPO, number)
+                            .unwrap_or_default();
+                        let _ = tx.send(app::Msg::Reviewers(list));
+                    });
+                }
+            }
         }
         _ => app.flash("unknown action"),
     }
@@ -1025,6 +1063,9 @@ fn truncate_title(title: &str) -> String {
 }
 
 fn dump(no_gh: bool) -> Result<()> {
+    // A one-shot that fetches for itself below, so there is nothing for a daemon
+    // to do here but start up and outlive the command that started it.
+    std::env::set_var("PROJ_NO_DAEMON", "1");
     let mut app = App::new()?;
     app.scan_now()?;
     if !no_gh {

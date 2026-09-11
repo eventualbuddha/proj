@@ -32,7 +32,11 @@ complete -c proj -n __proj_needs_command -a list -d "List projects and workstrea
 complete -c proj -n __proj_needs_command -a cd -d "Change to a project or workstream"
 complete -c proj -n __proj_needs_command -a status -d "Show workstream branches and drift"
 complete -c proj -n __proj_needs_command -a st -d "Show workstream branches and drift"
+complete -c proj -n __proj_needs_command -a daemon -d "The shared fetcher: status or stop"
 complete -c proj -n __proj_needs_command -a help -d "Show help"
+
+complete -c proj -n '__proj_using_command_any daemon' -a status -d "What the running daemon is doing"
+complete -c proj -n '__proj_using_command_any daemon' -a stop -d "Ask it to exit now"
 
 # new — the argument is a project the workstream will be created under, so
 # complete projects with a trailing slash rather than existing workstreams.
