@@ -95,7 +95,7 @@ query($owner: String!, $name: String!, $number: Int!) {
 
 /// The on-disk shape. Its own serde types rather than reusing the model, so a
 /// change to the model does not silently invalidate every cache file.
-#[derive(serde::Serialize, Deserialize, Default)]
+#[derive(serde::Serialize, Deserialize, Default, Clone)]
 pub struct Cache {
     pub fetched_at: u64,
     pub prs: Vec<CachedPr>,

@@ -1053,7 +1053,7 @@ fn draw_help(f: &mut Frame) {
         Line::from("  o               open its PR url, or copy it"),
         Line::from("  b               rebase on main, then rebuild"),
         Line::from("  p / P           push / force-push with lease"),
-        Line::from("  d               delete it, after confirming"),
+        Line::from("  d               delete it, after confirming — a virtual row's branch, local and remote"),
         Line::from(""),
         Line::from(Span::styled("  in the review queue", Style::default().bold())),
         Line::from("  ↵               check the PR out under review/ and build it, or cd there"),

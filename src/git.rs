@@ -7,8 +7,9 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::model::{GitState, Merged, Op, OpKind};
 
@@ -264,12 +265,13 @@ pub fn remote_name(branch: &str, upstream: Option<&str>, configured: Option<&str
 /// The remote-side namespace for this user's branches.
 pub const HANDLE: &str = "brian/";
 
-/// Answer the merged question three ways, cheapest and most trustworthy first.
+/// Answer the merged question four ways, cheapest and most trustworthy first.
 ///
-/// `git cherry` is the one that matters in this repo: it compares patch-ids, so
-/// it still says yes after a squash merge rewrote the history. A branch whose
-/// commits are all `-` (equivalent found upstream) is in `main`, whatever
-/// ancestry says.
+/// Patch-ids are what matter in this repo, since a squash merge rewrites the
+/// history and ancestry then says no about every merged branch. `git cherry`
+/// asks that question one commit at a time, which only settles a branch that
+/// squashed down to a single commit; `squashed_into` asks it of the branch's
+/// whole diff, which is what a squash of several commits actually becomes.
 ///
 /// A merged PR is reported as merged only when nothing local contradicts it. It
 /// is the *PR* that merged, not the branch: commits pushed after the merge, or
@@ -283,21 +285,20 @@ pub fn merged(dir: &Path, branch: &str, base: &str, pr_merged: bool) -> Merged {
     }
 
     if let Some(out) = ok(dir, &["cherry", base, branch]) {
-        let mut any = false;
-        for line in out.lines() {
-            if line.is_empty() {
-                continue;
+        let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+        // `+` means no equivalent *commit* upstream. On its own that is not an
+        // answer -- a branch squashed into one commit has a `+` against every
+        // commit it was built from -- so the whole-branch patch gets a say
+        // before this reports anything as unmerged.
+        if !lines.is_empty() {
+            if !lines.iter().any(|l| l.starts_with('+')) {
+                // Every commit has an equivalent in main. A rebase-and-merge
+                // looks exactly like this, and so does a one-commit squash.
+                return if pr_merged { Merged::Pr } else { Merged::Equivalent };
             }
-            any = true;
-            // `+` means no equivalent commit upstream, so this branch still has
-            // something main does not.
-            if line.starts_with('+') {
+            if !squashed_into(dir, branch, base) {
                 return Merged::No;
             }
-        }
-        if any {
-            // Every commit has an equivalent in main. A squash merge looks
-            // exactly like this, and so does a rebase-and-merge.
             return if pr_merged { Merged::Pr } else { Merged::Equivalent };
         }
     }
@@ -311,9 +312,193 @@ pub fn merged(dir: &Path, branch: &str, base: &str, pr_merged: bool) -> Merged {
     }
 }
 
+/// The patch-id of a diff produced by `git <args>`, as `git patch-id --stable`
+/// computes it.
+fn patch_id(dir: &Path, args: &[&str]) -> Option<String> {
+    let diff = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    if !diff.status.success() || diff.stdout.is_empty() {
+        return None;
+    }
+
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["patch-id", "--stable"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // The answer is one short line, so the pipe cannot fill while `git
+    // patch-id` is still reading its input.
+    child.stdin.take()?.write_all(&diff.stdout).ok()?;
+    let out = child.wait_with_output().ok()?;
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let id = text.split_whitespace().next()?;
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Whether the branch landed on `base` as a single squashed commit.
+///
+/// `git cherry` compares one commit at a time, so a squash of more than one
+/// commit defeats it: none of the branch's commits has an equivalent patch
+/// upstream, only their sum does. That sum is what this looks for -- the
+/// patch-id of the branch's whole diff, against the commits on `base` that
+/// touched the same files.
+fn squashed_into(dir: &Path, branch: &str, base: &str) -> bool {
+    let Some(mb) = ok(dir, &["merge-base", base, branch]) else {
+        return false;
+    };
+    let Some(want) = patch_id(dir, &["diff", &mb, branch]) else {
+        return false;
+    };
+
+    // Only a commit that touched the same files can carry the same patch, and
+    // on a busy `main` that is the difference between a handful of candidates
+    // and every commit since the branch started.
+    let files = ok(dir, &["diff", "--name-only", &mb, branch]).unwrap_or_default();
+    let range = format!("{mb}..{base}");
+    let mut args = vec!["rev-list", &range, "--"];
+    args.extend(files.lines());
+    let Some(candidates) = ok(dir, &args) else {
+        return false;
+    };
+
+    candidates
+        .lines()
+        .any(|sha| patch_id(dir, &["show", sha]).as_deref() == Some(want.as_str()))
+}
+
+/// Commits on `dir`'s HEAD that exist neither on `base` nor on a remote.
+///
+/// This is the question `proj rm` refuses on, so it lives here rather than in
+/// the shell: the confirmation the TUI shows and the check that enforces it
+/// have to be the same answer, and two implementations of patch-id matching
+/// were two chances to disagree.
+pub fn stranded(dir: &Path, base: &str) -> Vec<String> {
+    // A squash merge of more than one commit lands under a sha of its own, and
+    // `git cherry` -- one commit at a time -- calls every commit it was built
+    // from stranded. The branch's whole diff is the thing that merged.
+    if squashed_into(dir, "HEAD", base) {
+        return Vec::new();
+    }
+
+    let Some(out) = ok(dir, &["cherry", base, "HEAD"]) else {
+        return Vec::new();
+    };
+
+    out.lines()
+        .filter_map(|l| l.strip_prefix("+ "))
+        // Still reachable from the remote-tracking ref, so removing the
+        // worktree loses nothing.
+        .filter(|sha| run(dir, &["merge-base", "--is-ancestor", sha, "@{upstream}"]).is_err())
+        .map(str::to_string)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch repo, since the whole point of these is what real `git`
+    /// does with patch-ids -- a fake would be testing the fake.
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("proj-git-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let s = Scratch(dir);
+            s.git(&["init", "--initial-branch=main", "--quiet"]);
+            s.git(&["config", "user.email", "t@example.com"]);
+            s.git(&["config", "user.name", "T"]);
+            s.commit("base", "0\n");
+            s
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            run(&self.0, args).unwrap_or_else(|e| panic!("git {}: {e}", args.join(" ")))
+        }
+
+        fn commit(&self, file: &str, body: &str) {
+            std::fs::write(self.0.join(file), body).expect("write");
+            self.git(&["add", "-A"]);
+            self.git(&["commit", "--quiet", "-m", &format!("add {file}")]);
+        }
+    }
+
+    /// The case that could not be deleted: five commits, squashed into one.
+    /// Every one of them is a `+` to `git cherry`, and none of them is at risk.
+    #[test]
+    fn a_squash_of_several_commits_is_merged_and_strands_nothing() {
+        let s = Scratch::new("squash");
+        s.git(&["checkout", "--quiet", "-b", "feature"]);
+        for i in 0..5 {
+            s.commit(&format!("f{i}"), &format!("{i}\n"));
+        }
+
+        s.git(&["checkout", "--quiet", "main"]);
+        s.git(&["merge", "--quiet", "--squash", "feature"]);
+        s.git(&["commit", "--quiet", "-m", "the whole feature (#1)"]);
+
+        assert!(
+            squashed_into(&s.0, "feature", "main"),
+            "the branch's whole diff is in main"
+        );
+        assert_eq!(merged(&s.0, "feature", "main", false), Merged::Equivalent);
+        assert_eq!(merged(&s.0, "feature", "main", true), Merged::Pr);
+
+        s.git(&["checkout", "--quiet", "feature"]);
+        assert!(stranded(&s.0, "main").is_empty(), "nothing is only here");
+    }
+
+    /// The check that must not soften: work that really does live nowhere else.
+    #[test]
+    fn a_commit_that_landed_nowhere_is_still_stranded() {
+        let s = Scratch::new("unmerged");
+        s.git(&["checkout", "--quiet", "-b", "feature"]);
+        s.commit("mine", "mine\n");
+
+        assert!(!squashed_into(&s.0, "feature", "main"));
+        assert_eq!(merged(&s.0, "feature", "main", false), Merged::No);
+        // Even GitHub saying the PR merged cannot vouch for this one.
+        assert_eq!(merged(&s.0, "feature", "main", true), Merged::No);
+        assert_eq!(stranded(&s.0, "main").len(), 1);
+    }
+
+    /// A commit pushed after the squash landed. The branch is half in main, and
+    /// the half that is not is exactly what a delete would lose.
+    #[test]
+    fn a_commit_added_after_the_squash_is_stranded() {
+        let s = Scratch::new("after");
+        s.git(&["checkout", "--quiet", "-b", "feature"]);
+        s.commit("f0", "0\n");
+        s.commit("f1", "1\n");
+
+        s.git(&["checkout", "--quiet", "main"]);
+        s.git(&["merge", "--quiet", "--squash", "feature"]);
+        s.git(&["commit", "--quiet", "-m", "the feature (#1)"]);
+
+        s.git(&["checkout", "--quiet", "feature"]);
+        s.commit("f2", "2\n");
+
+        assert!(!squashed_into(&s.0, "feature", "main"));
+        assert_eq!(merged(&s.0, "feature", "main", true), Merged::No);
+        assert_eq!(stranded(&s.0, "main").len(), 3);
+    }
 
     #[test]
     fn the_configured_ref_outranks_the_tracking_ref_and_the_convention() {

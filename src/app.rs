@@ -370,6 +370,9 @@ pub struct App {
     pub workstream_idx: usize,
     pub fetched_at: Option<u64>,
     pub refreshing: bool,
+    /// The merged-ness pass runs after the fetch, on a thread of its own, so a
+    /// fetched dashboard is not yet a finished one.
+    pub merging: bool,
     pub loading: bool,
     pub scanning: bool,
     pub scanned_at: u64,
@@ -431,6 +434,7 @@ impl App {
             project_idx: 0,
             workstream_idx: 0,
             fetched_at: None,
+            merging: false,
             refreshing: false,
             loading: true,
             scanning: false,
@@ -611,11 +615,18 @@ impl App {
                     // selection jumps and the failing list blinks out every 15s.
                     let selection = self.selection();
                     let failing = self.failing_by_pr();
+                    let merged = self.merged_by_branch();
 
                     self.projects = *projects;
                     self.scanning = false;
                     self.loading = false;
                     self.restore_failing(&failing);
+                    // A scan knows nothing about merged-ness -- `discover` sets
+                    // every row to `No` -- so without this the dashboard forgets
+                    // which branches have landed every 15 seconds and only
+                    // remembers on the network minute. That is a `d` on a merged
+                    // branch reading "NOT merged into main".
+                    self.restore_merged(&merged);
                     // An explicit request wins over carrying the old selection
                     // forward; on the first scan there is no old one anyway.
                     match pending {
@@ -674,6 +685,7 @@ impl App {
                 }
                 Msg::RefreshFailed(e) => {
                     self.refreshing = false;
+                    self.merging = false;
                     self.error = Some(e);
                 }
                 Msg::Reviewers(logins) => {
@@ -944,6 +956,25 @@ impl App {
             .collect()
     }
 
+    fn merged_by_branch(&self) -> Vec<(String, Merged)> {
+        self.projects
+            .iter()
+            .flat_map(|p| p.workstreams.iter())
+            .filter(|w| w.merged.is_merged())
+            .map(|w| (w.git.branch.clone(), w.merged))
+            .collect()
+    }
+
+    fn restore_merged(&mut self, merged: &[(String, Merged)]) {
+        for p in &mut self.projects {
+            for w in &mut p.workstreams {
+                if let Some((_, m)) = merged.iter().find(|(b, _)| *b == w.git.branch) {
+                    w.merged = *m;
+                }
+            }
+        }
+    }
+
     fn restore_failing(&mut self, failing: &[(u32, Vec<Check>)]) {
         for p in &mut self.projects {
             for w in &mut p.workstreams {
@@ -1033,5 +1064,66 @@ pub fn ago(then: u64) -> String {
         format!("{}h ago", d / 3600)
     } else {
         format!("{}d ago", d / 86400)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Origin, ProjectKind, Workstream};
+
+    fn tree(branch: &str, merged: Merged) -> Vec<Project> {
+        vec![Project {
+            slug: "backup-restore".into(),
+            emoji: "\u{1f510}".into(),
+            name: "Backup & restore".into(),
+            kind: ProjectKind::Project,
+            status: "active".into(),
+            readme: PathBuf::from("/tmp/backup-restore/README.md"),
+            branch_prefix: None,
+            branch_globs: Vec::new(),
+            workstreams: vec![Workstream {
+                project: "backup-restore".into(),
+                name: "workspace-separation".into(),
+                origin: Origin::Worktree,
+                path: Some(PathBuf::from("/tmp/w")),
+                git: crate::model::GitState {
+                    branch: branch.into(),
+                    ..Default::default()
+                },
+                merged,
+                pr: None,
+            }],
+        }]
+    }
+
+    /// A scan starts every row at `No`, so what it does not know has to be
+    /// carried over the tree it replaces -- or `d` on a merged branch reads
+    /// "NOT merged into main" for the rest of the minute.
+    #[test]
+    fn a_rescan_does_not_forget_which_branches_have_landed() {
+        let mut app = App::new().expect("app");
+        app.projects = tree("brian/feat/admin/restore-mode", Merged::Pr);
+
+        let carried = app.merged_by_branch();
+        app.projects = tree("brian/feat/admin/restore-mode", Merged::No);
+        app.restore_merged(&carried);
+
+        assert_eq!(app.projects[0].workstreams[0].merged, Merged::Pr);
+    }
+
+    /// Only merged-ness is carried. An unmerged row that the scan re-read is
+    /// the scan's answer, not a stale one held over.
+    #[test]
+    fn nothing_carries_a_branch_back_to_unmerged() {
+        let mut app = App::new().expect("app");
+        app.projects = tree("brian/feat/admin/restore-mode", Merged::No);
+
+        let carried = app.merged_by_branch();
+        assert!(carried.is_empty());
+
+        app.projects = tree("brian/feat/admin/restore-mode", Merged::Equivalent);
+        app.restore_merged(&carried);
+        assert_eq!(app.projects[0].workstreams[0].merged, Merged::Equivalent);
     }
 }

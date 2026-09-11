@@ -239,6 +239,10 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
                 # The row is gone, so reopening on it would land nowhere.
                 set reopen
 
+            case delete-branch
+                __proj_delete_branch "$parts[3]" "$parts[4]"
+                set reopen
+
             case '*'
                 echo "proj: the dashboard asked for something unknown: $parts[1]" >&2
                 return 1
@@ -774,27 +778,10 @@ function __proj_new
 end
 
 function __proj_stranded_commits --description "Commits on WORKTREE's HEAD that exist neither in main nor on its remote"
-    set -l wt_path "$argv[1]"
-
-    set -l main (__proj_remote_ref main)
-    test -n "$main"; or set main main
-
-    # Patch-ids, not ancestry. A squash merge rewrites the history, so every
-    # commit of a merged branch has a different sha and the same patch -- and
-    # `git cherry` is the only question that gets that right.
-    set -l out (git -C "$wt_path" cherry "$main" HEAD 2>/dev/null)
-    or return 0
-
-    for line in $out
-        set -l sha (string replace -rf '^\+ ' '' -- "$line")
-        or continue
-        # Still reachable from the remote-tracking ref, so removing the worktree
-        # loses nothing.
-        if git -C "$wt_path" merge-base --is-ancestor "$sha" '@{upstream}' 2>/dev/null
-            continue
-        end
-        echo "$sha"
-    end
+    # `proj-tui` owns this answer: the delete confirmation it draws and the
+    # refusal here have to agree, and patch-id matching is too easy to get
+    # subtly differently in two places.
+    proj-tui --stranded "$argv[1]" 2>/dev/null
 end
 
 function __proj_remove
@@ -898,6 +885,26 @@ function __proj_remove
     end
 
     echo "Workstream '$project/$workstream' removed"
+end
+
+function __proj_delete_branch --description "Delete a branch with no worktree, locally and on origin"
+    set -l branch "$argv[1]"
+    set -l remote "$argv[2]"
+    set -l repo (__proj_repo)
+
+    echo "Deleting branch '$branch'..."
+    # `-D`, not `-d`: a squash-merged branch is not an ancestor of main, and the
+    # dashboard already said what is at stake.
+    git -C "$repo" branch -D "$branch"
+    or return 1
+
+    # Ask the remote rather than trusting the tracking ref: a merged PR deletes
+    # its branch on GitHub, and pushing a delete for a branch that is already
+    # gone fails loudly over something that is not a problem.
+    if test -n "$remote"; and git -C "$repo" ls-remote --exit-code --heads origin "$remote" >/dev/null 2>&1
+        git -C "$repo" push origin --delete "$remote"
+        or echo "proj: kept origin/$remote (delete it with: git -C $repo push origin --delete $remote)" >&2
+    end
 end
 
 function __proj_list

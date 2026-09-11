@@ -17,6 +17,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use std::io::stdout;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use app::{App, Confirm, CopyMenu, Pane, Select};
@@ -84,6 +85,18 @@ fn main() -> Result<()> {
             while app.fetched_at.is_none() && std::time::Instant::now() < deadline {
                 app.drain();
                 std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        // And for the merged-ness pass behind the scan. A dashboard that has
+        // scanned is not yet one that can answer `d`: pressing it while the
+        // pass is still running drew "NOT merged into main" over a merged
+        // branch, since a fresh scan starts every row at `No`.
+        if waiting {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while (app.scanning || app.merging) && std::time::Instant::now() < deadline {
+                app.drain();
+                std::thread::sleep(Duration::from_millis(20));
             }
         }
 
@@ -876,11 +889,10 @@ fn confirm_delete(app: &mut App) {
     if app.sidebar == app::Sidebar::Reviews {
         return confirm_delete_review(app);
     }
-    let Some(w) = app.workstream() else { return };
-    if w.is_virtual() {
-        app.flash("nothing to delete — this branch has no worktree");
-        return;
+    if app.workstream().is_some_and(|w| w.is_virtual()) {
+        return confirm_delete_branch(app);
     }
+    let Some(w) = app.workstream() else { return };
 
     let qualified = w.qualified();
     let mut body = vec![format!("branch  {}", w.git.branch)];
@@ -918,6 +930,58 @@ fn confirm_delete(app: &mut App) {
         title: format!(" delete {qualified} "),
         body,
         verb: format!("delete\t{qualified}"),
+    });
+}
+
+/// Ask before deleting a branch that has no worktree.
+///
+/// There is no `proj rm` behind this one and so nothing that will refuse it:
+/// what the confirmation says about merged-ness and about commits that live
+/// nowhere else is the entire safety net.
+fn confirm_delete_branch(app: &mut App) {
+    let Some(w) = app.workstream() else { return };
+    let (qualified, branch, remote) = (
+        w.qualified(),
+        w.git.branch.clone(),
+        w.git.remote_branch.clone(),
+    );
+
+    let mut body = vec![format!("branch  {branch}")];
+    if w.merged.is_merged() {
+        body.push(format!("this is {} into main", w.merged.label()));
+    } else {
+        body.push("NOT merged into main".to_string());
+        let stranded = w.git.ahead.min(w.git.unpushed.unwrap_or(u32::MAX));
+        if stranded > 0 {
+            body.push(format!(
+                "{stranded} commit(s) are only here — they will be lost"
+            ));
+        }
+    }
+    if !w.git.pushed {
+        body.push("never pushed to a remote".to_string());
+    } else if w.git.upstream.is_none() {
+        body.push(format!("origin/{remote} is gone"));
+    } else {
+        body.push(format!("also deletes origin/{remote}"));
+    }
+    if w.pr
+        .as_ref()
+        .is_some_and(|pr| pr.state == model::PrState::Open)
+    {
+        body.push(format!(
+            "PR #{} is still open",
+            w.pr.as_ref().unwrap().number
+        ));
+    }
+
+    app.confirm = Some(Confirm {
+        title: format!(" delete the branch {branch} "),
+        body,
+        // The remote name goes along whatever the tracking ref says: a prune
+        // that has not run yet leaves `origin/<name>` there to delete, and the
+        // remote side is checked before anything is pushed.
+        verb: format!("delete-branch\t{qualified}\t{branch}\t{remote}"),
     });
 }
 
@@ -1452,6 +1516,69 @@ mod delete_tests {
         assert!(!body.contains("never pushed"), "it was pushed: {body}");
         assert!(body.contains("origin/backup-restore/bump-test-timeout is gone"));
         assert!(body.contains("merged into main"));
+    }
+
+    /// A virtual row has no worktree to remove, so `d` goes after the branch
+    /// itself -- and says that the remote is going too.
+    #[test]
+    fn a_branch_with_no_worktree_is_deleted_on_both_sides() {
+        let mut a = app(
+            GitState {
+                branch: "backup-restore/esm-batch-4".into(),
+                remote_branch: "brian/esm-batch-4".into(),
+                ahead: 2,
+                upstream: Some("origin/brian/esm-batch-4".into()),
+                unpushed: Some(0),
+                pushed: true,
+                ..Default::default()
+            },
+            Merged::No,
+        );
+        a.projects[0].workstreams[0].path = None;
+        a.projects[0].workstreams[0].origin = Origin::OrphanBranch;
+        a.confirm = None;
+        handle_key(
+            &mut a,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        let c = a.confirm.as_ref().expect("a confirmation");
+        assert_eq!(
+            c.verb,
+            "delete-branch\tbackup-restore/bump-test-timeout\tbackup-restore/esm-batch-4\tbrian/esm-batch-4"
+        );
+        let body = c.body.join("\n");
+        assert!(
+            body.contains("also deletes origin/brian/esm-batch-4"),
+            "{body}"
+        );
+        assert!(body.contains("NOT merged"), "{body}");
+    }
+
+    /// Nothing is pushed, so the branch is the only copy of those commits.
+    #[test]
+    fn an_unpushed_branch_with_no_worktree_says_what_is_lost() {
+        let mut a = app(
+            GitState {
+                branch: "backup-restore/scratch".into(),
+                remote_branch: "brian/scratch".into(),
+                ahead: 3,
+                upstream: None,
+                unpushed: None,
+                pushed: false,
+                ..Default::default()
+            },
+            Merged::No,
+        );
+        a.projects[0].workstreams[0].path = None;
+        a.projects[0].workstreams[0].origin = Origin::OrphanBranch;
+        a.confirm = None;
+        handle_key(
+            &mut a,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        let body = body(&a);
+        assert!(body.contains("3 commit(s) are only here"), "{body}");
+        assert!(body.contains("never pushed"), "{body}");
     }
 
     #[test]
