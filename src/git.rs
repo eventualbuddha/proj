@@ -279,7 +279,7 @@ pub const HANDLE: &str = "brian/";
 /// calling that "merged" is how a delete confirmation ends up vouching for work
 /// that only exists here.
 pub fn merged(dir: &Path, branch: &str, base: &str, pr_merged: bool) -> Merged {
-    let arg = format!("{base}");
+    let arg = base.to_string();
     if run(dir, &["merge-base", "--is-ancestor", branch, &arg]).is_ok() {
         return if pr_merged { Merged::Pr } else { Merged::Ancestor };
     }

@@ -467,7 +467,7 @@ pub fn viewer(owner: &str) -> Result<(String, Vec<String>)> {
     .trim()
     .to_string();
 
-    let jq = format!("{}", r#".[] | "\(.organization.login)/\(.slug)""#);
+    let jq = r#".[] | "\(.organization.login)/\(.slug)""#.to_string();
     let teams = gh(&[
         "api".into(),
         "user/teams".into(),
@@ -550,11 +550,6 @@ pub fn to_reviews(cache: &Cache) -> Vec<Review> {
             url: r.url.clone(),
             author: r.author.clone(),
             branch: r.branch.clone(),
-            state: if r.state == "DRAFT" {
-                PrState::Draft
-            } else {
-                PrState::Open
-            },
             checks: Checks {
                 state: CheckState::parse(&r.check_state),
                 total: r.check_total,
@@ -595,7 +590,6 @@ pub fn apply(projects: &mut [Project], cache: &Cache) {
                 },
                 title: c.title.clone(),
                 url: c.url.clone(),
-                author: c.author.clone(),
                 review_decision: c.review_decision.clone(),
                 checks: Checks {
                     state: CheckState::parse(&c.check_state),

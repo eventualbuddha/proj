@@ -376,8 +376,6 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_reviews(f: &mut Frame, app: &mut App, area: Rect) {
-    let title = format!("Reviews ({})", app.reviews.len());
-
     if app.reviews.is_empty() {
         // An empty queue is the normal state here -- reviews turn over the same
         // day -- so it needs to read as "nothing waiting", not as "broken".

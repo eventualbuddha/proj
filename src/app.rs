@@ -37,7 +37,7 @@ pub enum Msg {
     /// The filesystem+git scan finished. Carries the whole tree, because the
     /// scan runs off the UI thread and there is nothing useful to show until it
     /// is complete.
-    Scanned(Box<Vec<Project>>),
+    Scanned(Vec<Project>),
     Refreshed(Box<github::Cache>),
     RefreshFailed(String),
     /// Merged-ness, keyed by branch. Deliberately *not* a whole tree: sending
@@ -429,7 +429,6 @@ pub struct App {
     /// terminal where you can read it and interrupt it. Running that inside the
     /// TUI would mean a log pane reimplementing what the shell already does.
     pub action: Option<String>,
-    pub quit: bool,
 }
 
 impl App {
@@ -475,7 +474,6 @@ impl App {
             daemon: None,
             sent_branches: Vec::new(),
             action: None,
-            quit: false,
         };
         // Draw last run's state immediately; the scan replaces it when it lands.
         if let Some(projects) = crate::cache::load() {
@@ -533,7 +531,7 @@ impl App {
             }
             compute_merged(&mut projects);
             crate::cache::save(&projects);
-            let _ = tx.send(Msg::Scanned(Box::new(projects)));
+            let _ = tx.send(Msg::Scanned(projects));
         });
     }
 
@@ -695,7 +693,7 @@ impl App {
                     let failing = self.failing_by_pr();
                     let merged = self.merged_by_branch();
 
-                    self.projects = *projects;
+                    self.projects = projects;
                     self.scanning = false;
                     self.loading = false;
                     self.restore_failing(&failing);
@@ -1172,7 +1170,7 @@ pub fn ago(then: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Origin, ProjectKind, Workstream};
+    use crate::model::{ProjectKind, Workstream};
 
     fn tree(branch: &str, merged: Merged) -> Vec<Project> {
         vec![Project {
@@ -1187,7 +1185,6 @@ mod tests {
             workstreams: vec![Workstream {
                 project: "backup-restore".into(),
                 name: "workspace-separation".into(),
-                origin: Origin::Worktree,
                 path: Some(PathBuf::from("/tmp/w")),
                 git: crate::model::GitState {
                     branch: branch.into(),

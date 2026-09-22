@@ -540,11 +540,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         // A materialized row is a cd. A virtual one has nowhere to go yet,
         // so it becomes a request to create it -- handed to the shell, which
         // can show the build and be interrupted.
-        KeyCode::Enter => {
-            if activate(app) {
-                return true;
-            }
-        }
+        KeyCode::Enter if activate(app) => return true,
         _ => {}
     }
 
@@ -1219,7 +1215,6 @@ mod review_tests {
             url: format!("https://github.com/votingworks/vxsuite/pull/{number}"),
             author: "someone".into(),
             branch: "someone/fix".into(),
-            state: PrState::Open,
             checks: Checks::default(),
             reason: ReviewReason::Requested,
             updated: 0,
@@ -1246,7 +1241,6 @@ mod review_tests {
                 .map(|d| Workstream {
                     project: "review".into(),
                     name: (*d).into(),
-                    origin: Origin::Worktree,
                     path: Some(PathBuf::from(format!("/tmp/projects/review/{d}"))),
                     git: GitState::default(),
                     merged: Merged::No,
@@ -1399,7 +1393,6 @@ mod new_workstream_tests {
         Workstream {
             project: "react-19".into(),
             name: name.into(),
-            origin: Origin::Worktree,
             path: Some(std::path::PathBuf::from(format!("/tmp/react-19/{name}"))),
             git: GitState {
                 branch: format!("react-19/{name}"),
@@ -1518,7 +1511,6 @@ mod delete_tests {
             workstreams: vec![Workstream {
                 project: "backup-restore".into(),
                 name: "bump-test-timeout".into(),
-                origin: Origin::Worktree,
                 path: Some(std::path::PathBuf::from("/tmp/w")),
                 git,
                 merged,
@@ -1576,7 +1568,6 @@ mod delete_tests {
             Merged::No,
         );
         a.projects[0].workstreams[0].path = None;
-        a.projects[0].workstreams[0].origin = Origin::OrphanBranch;
         a.confirm = None;
         handle_key(
             &mut a,
@@ -1611,7 +1602,6 @@ mod delete_tests {
             Merged::No,
         );
         a.projects[0].workstreams[0].path = None;
-        a.projects[0].workstreams[0].origin = Origin::OrphanBranch;
         a.confirm = None;
         handle_key(
             &mut a,
@@ -1888,7 +1878,6 @@ mod github_menu_tests {
         Workstream {
             project: "p".into(),
             name: "w".into(),
-            origin: Origin::Worktree,
             path: Some(std::path::PathBuf::from("/tmp/w")),
             git: GitState { branch: "p/w".into(), remote_branch: "brian/p/w".into(), ..Default::default() },
             merged: Merged::No,

@@ -20,12 +20,9 @@ fn has_display() -> bool {
 }
 
 fn opener() -> Option<&'static str> {
-    for candidate in ["xdg-open", "sensible-browser"] {
-        if which(candidate) {
-            return Some(candidate);
-        }
-    }
-    None
+    ["xdg-open", "sensible-browser"]
+        .into_iter()
+        .find(|candidate| which(candidate))
 }
 
 fn which(name: &str) -> bool {

@@ -570,7 +570,7 @@ mod tests {
     /// branches the next dashboard will open onto.
     #[test]
     fn branches_outlive_the_window_that_asked_for_them() {
-        let mut d = daemon();
+        let d = daemon();
         assert_eq!(d.union(&["brian/a".to_string()]), ["brian/a"]);
     }
 

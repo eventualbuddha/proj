@@ -8,15 +8,6 @@
 
 use std::path::PathBuf;
 
-/// Where a row came from, and therefore what can be done with it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Origin {
-    /// A directory under a project. Has a branch, may have a PR.
-    Worktree,
-    /// A local branch matching the project, with no worktree anywhere.
-    OrphanBranch,
-}
-
 /// A sequencer operation the worktree is part-way through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpKind {
@@ -305,7 +296,6 @@ pub struct PrInfo {
     pub state: PrState,
     pub title: String,
     pub url: String,
-    pub author: String,
     /// GitHub's `reviewDecision`: APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED.
     pub review_decision: Option<String>,
     pub checks: Checks,
@@ -318,7 +308,6 @@ pub struct PrInfo {
 pub struct Workstream {
     pub project: String,
     pub name: String,
-    pub origin: Origin,
     /// `None` for a virtual row.
     pub path: Option<PathBuf>,
     pub git: GitState,
@@ -383,7 +372,6 @@ pub struct Review {
     pub url: String,
     pub author: String,
     pub branch: String,
-    pub state: PrState,
     pub checks: Checks,
     pub reason: ReviewReason,
     /// Unix seconds of the head commit, for "how stale is what I am looking at".

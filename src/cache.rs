@@ -116,11 +116,6 @@ pub fn load() -> Option<Vec<Project>> {
                     .map(|w| Workstream {
                         project: p.slug.clone(),
                         name: w.name,
-                        origin: if w.path.is_some() {
-                            Origin::Worktree
-                        } else {
-                            Origin::OrphanBranch
-                        },
                         path: w.path.map(PathBuf::from),
                         git: GitState {
                             branch: w.branch,

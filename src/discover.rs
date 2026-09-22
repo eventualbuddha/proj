@@ -186,7 +186,6 @@ pub fn scan() -> Result<Vec<Project>> {
             project.workstreams.push(Workstream {
                 project: project.slug.clone(),
                 name,
-                origin: Origin::Worktree,
                 path: Some(path),
                 git: git_state,
                 merged: Merged::No,
@@ -225,7 +224,6 @@ pub fn scan() -> Result<Vec<Project>> {
         projects[idx].workstreams.push(Workstream {
             project: slug,
             name,
-            origin: Origin::OrphanBranch,
             path: None,
             git: git_state,
             merged: Merged::No,
@@ -296,7 +294,7 @@ fn claim(projects: &[Project], branch: &str) -> Option<usize> {
         }
         if let Some(prefix) = &p.branch_prefix {
             if branch.starts_with(prefix.as_str())
-                && best.map_or(true, |(_, len)| prefix.len() > len)
+                && best.is_none_or(|(_, len)| prefix.len() > len)
             {
                 best = Some((i, prefix.len()));
             }
