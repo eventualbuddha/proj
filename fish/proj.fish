@@ -316,7 +316,7 @@ function __proj_review_checkout --description "Check out PR NUMBER into the revi
         return 1
     end
 
-    git -C (__proj_repo) worktree add "$wt_path" "$branch"
+    __proj_worktree_add "$wt_path" "$wt_path" "$branch"
     or return 1
 
     __proj_goto "$wt_path"
@@ -636,6 +636,31 @@ function __proj_rebase_and_build --description "Rebase the worktree at PATH onto
     __proj_build
 end
 
+function __proj_worktree_add --description "Add the worktree at PATH (git worktree add ARGS...), reflink-cloning the canonical clone into it where the filesystem allows"
+    set -l wt_path "$argv[1]"
+    set -e argv[1]
+    set -l repo (__proj_repo)
+
+    git -C "$repo" worktree add --no-checkout $argv
+    or return 1
+
+    # `--reflink=always` fails rather than falling back to a full copy of every
+    # node_modules and build output; a plain checkout is cheaper than that.
+    set -l entries (string match -v -- "$repo/.git" $repo/* $repo/.*)
+    if not cp -a --reflink=always $entries "$wt_path/" 2>/dev/null
+        echo "proj: cannot reflink $repo, checking out instead" >&2
+        rm -rf (string match -v -- "$wt_path/.git" $wt_path/* $wt_path/.*)
+    end
+
+    # The clone carries the canonical clone's checkout, so bring the tracked
+    # files to this branch -- rewriting only those that differ, which keeps the
+    # rest shared -- and drop its untracked files. Ignored files (node_modules,
+    # build output) stay, and are what makes the first build incremental.
+    git -C "$wt_path" reset -q
+    and git -C "$wt_path" reset -q --hard
+    and git -C "$wt_path" clean -fdq
+end
+
 function __proj_goto --description "cd to a path, remembering where we came from"
     set -g __proj_last_dir (pwd)
     cd "$argv[1]"
@@ -753,7 +778,7 @@ function __proj_new
         end
     end
 
-    git -C (__proj_repo) worktree add $git_args
+    __proj_worktree_add "$wt_path" $git_args
     or begin
         echo "proj new: failed to create worktree" >&2
         return 1
