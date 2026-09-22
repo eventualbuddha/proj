@@ -128,7 +128,8 @@ pub struct CachedPr {
     pub author: String,
     pub review_decision: Option<String>,
     pub check_state: String,
-    pub check_total: u32,    #[serde(default)]
+    pub check_total: u32,
+    #[serde(default)]
     pub base: String,
     #[serde(default)]
     pub reviewers: Vec<(String, String)>,
@@ -215,9 +216,10 @@ pub fn refresh(owner: &str, name: &str, branches: &[String]) -> Result<Cache> {
             // Several forks can carry a PR with this head ref name; only the one
             // in this repo's own owner is ours. Newest first, so the first match
             // is the live PR for a branch reused across several.
-            let Some(node) = nodes.iter().find(|n| {
-                n["headRepositoryOwner"]["login"].as_str() == Some(owner)
-            }) else {
+            let Some(node) = nodes
+                .iter()
+                .find(|n| n["headRepositoryOwner"]["login"].as_str() == Some(owner))
+            else {
                 continue;
             };
 
@@ -299,12 +301,25 @@ query($o: String!, $n: String!, $p: Int!) {
             out.push(l.to_string());
         }
     };
-    for r in pr["suggestedReviewers"].as_array().cloned().unwrap_or_default() {
+    for r in pr["suggestedReviewers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
         push(r["reviewer"]["login"].as_str().unwrap_or(""));
     }
-    for r in pr["reviewRequests"]["nodes"].as_array().cloned().unwrap_or_default() {
+    for r in pr["reviewRequests"]["nodes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
         let w = &r["requestedReviewer"];
-        push(w["login"].as_str().or_else(|| w["slug"].as_str()).unwrap_or(""));
+        push(
+            w["login"]
+                .as_str()
+                .or_else(|| w["slug"].as_str())
+                .unwrap_or(""),
+        );
     }
     Ok(out)
 }
@@ -312,14 +327,24 @@ query($o: String!, $n: String!, $p: Int!) {
 /// Pending review requests first, then anyone who has already responded.
 fn parse_reviewers(node: &serde_json::Value) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for r in node["reviewRequests"]["nodes"].as_array().cloned().unwrap_or_default() {
+    for r in node["reviewRequests"]["nodes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
         let who = &r["requestedReviewer"];
         if let Some(login) = who["login"].as_str().or_else(|| who["slug"].as_str()) {
             out.push((login.to_string(), "PENDING".to_string()));
         }
     }
-    for r in node["latestReviews"]["nodes"].as_array().cloned().unwrap_or_default() {
-        let Some(login) = r["author"]["login"].as_str() else { continue };
+    for r in node["latestReviews"]["nodes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        let Some(login) = r["author"]["login"].as_str() else {
+            continue;
+        };
         if out.iter().any(|(l, _)| l == login) {
             continue;
         }
@@ -424,7 +449,10 @@ pub fn review_queue(
                 continue;
             }
             let commit = &n["commits"]["nodes"][0]["commit"];
-            let updated = commit["committedDate"].as_str().map(iso_to_unix).unwrap_or(0);
+            let updated = commit["committedDate"]
+                .as_str()
+                .map(iso_to_unix)
+                .unwrap_or(0);
 
             if reason == "re-review" {
                 // Only when it moved since you looked.
@@ -445,7 +473,11 @@ pub fn review_queue(
                 url: n["url"].as_str().unwrap_or("").to_string(),
                 author: n["author"]["login"].as_str().unwrap_or("").to_string(),
                 branch: n["headRefName"].as_str().unwrap_or("").to_string(),
-                state: if is_draft { "DRAFT".into() } else { "OPEN".into() },
+                state: if is_draft {
+                    "DRAFT".into()
+                } else {
+                    "OPEN".into()
+                },
                 reason: reason.to_string(),
                 check_state: rollup["state"].as_str().unwrap_or("NONE").to_string(),
                 check_total: rollup["contexts"]["totalCount"].as_u64().unwrap_or(0) as u32,

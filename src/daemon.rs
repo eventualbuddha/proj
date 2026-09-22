@@ -165,7 +165,9 @@ impl Daemon {
                     // The contexts memo describes the commits the last fetch saw;
                     // a new rollup may be about different ones.
                     self.contexts.clear();
-                    self.broadcast(&Res::Cache { cache: cache.clone() });
+                    self.broadcast(&Res::Cache {
+                        cache: cache.clone(),
+                    });
                     self.cache = Some(*cache);
                     self.broadcast(&Res::Fetching { on: false });
                     if std::mem::take(&mut self.again) {
@@ -182,7 +184,8 @@ impl Daemon {
                 }
                 Ev::Contexts(number, checks) => {
                     self.contexts_inflight.retain(|n| *n != number);
-                    self.contexts.insert(number, (github::now(), checks.clone()));
+                    self.contexts
+                        .insert(number, (github::now(), checks.clone()));
                     // To everyone: several instances watching the same PR is the
                     // normal case, and they all key the answer by number.
                     self.broadcast(&Res::Contexts {
@@ -245,7 +248,14 @@ impl Daemon {
             let _ = tx.send(Ev::Gone(id));
         });
 
-        self.clients.insert(id, Client { out, branches: Vec::new(), watching: false });
+        self.clients.insert(
+            id,
+            Client {
+                out,
+                branches: Vec::new(),
+                watching: false,
+            },
+        );
 
         // Answer the connection itself with whatever is already known, so an
         // instance draws PR state before its first scan has even finished.
@@ -400,7 +410,13 @@ impl Daemon {
 
     fn status(&self) -> String {
         let now = github::now();
-        let age = |t: u64| if t == 0 { "never".to_string() } else { format!("{}s ago", now - t) };
+        let age = |t: u64| {
+            if t == 0 {
+                "never".to_string()
+            } else {
+                format!("{}s ago", now - t)
+            }
+        };
         format!(
             "pid {}\nup {}s\nwatching {}\nbranches {}\nlast fetch {}{}\nnext fetch every {}s\n{}",
             std::process::id(),
@@ -411,7 +427,11 @@ impl Daemon {
             if self.fetching { " (fetching now)" } else { "" },
             self.interval(),
             match self.idle_since {
-                Some(since) => format!("idle {}s, exits in {}s", now - since, IDLE_EXIT.saturating_sub(now - since)),
+                Some(since) => format!(
+                    "idle {}s, exits in {}s",
+                    now - since,
+                    IDLE_EXIT.saturating_sub(now - since)
+                ),
                 None => "in use".to_string(),
             },
         )
@@ -457,7 +477,9 @@ fn bind(path: &Path) -> Result<Option<UnixListener>> {
         return Ok(None);
     }
     let _ = std::fs::remove_file(path);
-    Ok(Some(UnixListener::bind(path).context("binding the daemon socket")?))
+    Ok(Some(
+        UnixListener::bind(path).context("binding the daemon socket")?,
+    ))
 }
 
 struct Lock(PathBuf);
@@ -465,14 +487,22 @@ struct Lock(PathBuf);
 impl Lock {
     fn take(path: &Path) -> Result<Lock> {
         for _ in 0..50 {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
                 Ok(_) => return Ok(Lock(path.to_path_buf())),
                 Err(_) => {
                     // Held for the microseconds of a bind, so anything older
                     // than this is a lock whose holder died before releasing it.
                     let stale = std::fs::metadata(path)
                         .and_then(|m| m.modified())
-                        .map(|t| t.elapsed().map(|e| e > Duration::from_secs(10)).unwrap_or(false))
+                        .map(|t| {
+                            t.elapsed()
+                                .map(|e| e > Duration::from_secs(10))
+                                .unwrap_or(false)
+                        })
                         .unwrap_or(true);
                     if stale {
                         let _ = std::fs::remove_file(path);

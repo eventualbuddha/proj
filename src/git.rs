@@ -156,7 +156,11 @@ pub fn worktrees(repo: &Path) -> Result<HashMap<String, PathBuf>> {
 pub fn local_branches(repo: &Path) -> Result<Vec<(String, String)>> {
     let out = run(
         repo,
-        &["for-each-ref", "--format=%(refname:short)%09%(objectname)", "refs/heads"],
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)%09%(objectname)",
+            "refs/heads",
+        ],
     )?;
     Ok(out
         .lines()
@@ -187,8 +191,8 @@ pub fn state(dir: &Path, branch: &str, base: &str, materialized: bool) -> GitSta
         st.ahead = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     }
 
-    st.last_commit = ok(dir, &["log", "-1", "--format=%ct", branch])
-        .and_then(|s| s.trim().parse().ok());
+    st.last_commit =
+        ok(dir, &["log", "-1", "--format=%ct", branch]).and_then(|s| s.trim().parse().ok());
 
     let upstream_ref = format!("{branch}@{{upstream}}");
     st.upstream = ok(dir, &["rev-parse", "--abbrev-ref", &upstream_ref]);
@@ -202,8 +206,7 @@ pub fn state(dir: &Path, branch: &str, base: &str, materialized: bool) -> GitSta
     st.remote_branch = remote_name(branch, st.upstream.as_deref(), configured.as_deref());
     if let Some(up) = &st.upstream {
         let r = format!("{up}..{branch}");
-        st.unpushed = ok(dir, &["rev-list", "--count", &r])
-            .and_then(|s| s.trim().parse().ok());
+        st.unpushed = ok(dir, &["rev-list", "--count", &r]).and_then(|s| s.trim().parse().ok());
     }
 
     // Working-tree facts exist only where there is a working tree.
@@ -281,7 +284,11 @@ pub const HANDLE: &str = "brian/";
 pub fn merged(dir: &Path, branch: &str, base: &str, pr_merged: bool) -> Merged {
     let arg = base.to_string();
     if run(dir, &["merge-base", "--is-ancestor", branch, &arg]).is_ok() {
-        return if pr_merged { Merged::Pr } else { Merged::Ancestor };
+        return if pr_merged {
+            Merged::Pr
+        } else {
+            Merged::Ancestor
+        };
     }
 
     if let Some(out) = ok(dir, &["cherry", base, branch]) {
@@ -294,12 +301,20 @@ pub fn merged(dir: &Path, branch: &str, base: &str, pr_merged: bool) -> Merged {
             if !lines.iter().any(|l| l.starts_with('+')) {
                 // Every commit has an equivalent in main. A rebase-and-merge
                 // looks exactly like this, and so does a one-commit squash.
-                return if pr_merged { Merged::Pr } else { Merged::Equivalent };
+                return if pr_merged {
+                    Merged::Pr
+                } else {
+                    Merged::Equivalent
+                };
             }
             if !squashed_into(dir, branch, base) {
                 return Merged::No;
             }
-            return if pr_merged { Merged::Pr } else { Merged::Equivalent };
+            return if pr_merged {
+                Merged::Pr
+            } else {
+                Merged::Equivalent
+            };
         }
     }
 

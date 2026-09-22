@@ -4,9 +4,9 @@ mod client;
 mod daemon;
 mod discover;
 mod git;
-mod link;
 mod github;
 mod ipc;
+mod link;
 mod model;
 mod ui;
 
@@ -265,9 +265,9 @@ fn select_target(args: &[String]) -> Option<Select> {
 fn setup() -> Result<Terminal> {
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-    Ok(ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(
-        stdout(),
-    ))?)
+    Ok(ratatui::Terminal::new(
+        ratatui::backend::CrosstermBackend::new(stdout()),
+    )?)
 }
 
 type Terminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
@@ -285,7 +285,11 @@ fn run(term: &mut Terminal, app: &mut App) -> Result<()> {
         app.drain();
         app.tick();
         app.clamp();
-        if app.flash.as_ref().is_some_and(|(_, until)| github::now() > *until) {
+        if app
+            .flash
+            .as_ref()
+            .is_some_and(|(_, until)| github::now() > *until)
+        {
             app.flash = None;
         }
         // Asking here rather than on selection keeps it to one place, and the
@@ -787,7 +791,11 @@ fn copy_selected(app: &mut App) {
         app.copy_menu = None;
         if let (Some(login), Some(pending)) = (login, pending) {
             let (verb, number) = pending.split_once(':').unwrap_or(("review", ""));
-            let v = if verb == "ready-review" { "gh-ready-review" } else { "gh-review" };
+            let v = if verb == "ready-review" {
+                "gh-ready-review"
+            } else {
+                "gh-review"
+            };
             app.action = Some(format!("{v}\t{number}\t{login}"));
         }
         return;
@@ -936,7 +944,10 @@ fn confirm_delete(app: &mut App) {
         body.push("NOT merged into main".to_string());
     }
     if w.git.dirty > 0 {
-        body.push(format!("{} uncommitted change(s) — proj rm will refuse", w.git.dirty));
+        body.push(format!(
+            "{} uncommitted change(s) — proj rm will refuse",
+            w.git.dirty
+        ));
     }
 
     // Commits that exist nowhere but here. Not the same question as "has an
@@ -1140,7 +1151,10 @@ mod tests {
         let mut a = app();
         a.pane = Pane::Workstreams;
         assert!(!handle_key(&mut a, esc()));
-        assert!(!handle_key(&mut a, esc()), "esc on the left pane still stays");
+        assert!(
+            !handle_key(&mut a, esc()),
+            "esc on the left pane still stays"
+        );
     }
 
     #[test]
@@ -1256,7 +1270,10 @@ mod review_tests {
     #[test]
     fn enter_on_a_review_with_no_worktree_checks_it_out() {
         let mut a = app(&[], vec![review(9083, "Fix the scanner status poll")]);
-        assert!(handle_key(&mut a, code(KeyCode::Enter)), "checking out quits");
+        assert!(
+            handle_key(&mut a, code(KeyCode::Enter)),
+            "checking out quits"
+        );
         assert_eq!(
             a.action.as_deref(),
             Some("review-checkout\t9083\t9083-fix-the-scanner-status")
@@ -1265,7 +1282,10 @@ mod review_tests {
 
     #[test]
     fn enter_on_a_checked_out_review_is_a_cd() {
-        let mut a = app(&["9083-fix-the-scanner"], vec![review(9083, "Fix the scanner status poll")]);
+        let mut a = app(
+            &["9083-fix-the-scanner"],
+            vec![review(9083, "Fix the scanner status poll")],
+        );
         assert!(handle_key(&mut a, code(KeyCode::Enter)));
         assert_eq!(
             a.action.as_deref(),
@@ -1277,16 +1297,26 @@ mod review_tests {
     /// after checkout is still the same checkout.
     #[test]
     fn a_retitled_pr_is_not_checked_out_twice() {
-        let a = app(&["9083-old-title-here"], vec![review(9083, "A completely different title")]);
+        let a = app(
+            &["9083-old-title-here"],
+            vec![review(9083, "A completely different title")],
+        );
         assert_eq!(
-            a.review().unwrap().worktree.as_ref().map(|p| p.display().to_string()),
+            a.review()
+                .unwrap()
+                .worktree
+                .as_ref()
+                .map(|p| p.display().to_string()),
             Some("/tmp/projects/review/9083-old-title-here".to_string())
         );
     }
 
     #[test]
     fn a_number_that_only_prefixes_another_is_not_a_match() {
-        let a = app(&["90830-something"], vec![review(9083, "Nine oh eight three")]);
+        let a = app(
+            &["90830-something"],
+            vec![review(9083, "Nine oh eight three")],
+        );
         assert!(a.review().unwrap().worktree.is_none());
     }
 
@@ -1301,7 +1331,10 @@ mod review_tests {
 
         let mut a = app(&[], vec![review(9083, "Fix it")]);
         assert!(handle_key(&mut a, key('c')));
-        assert_eq!(a.action.as_deref(), Some("review-checkout\t9083\t9083-fix-it"));
+        assert_eq!(
+            a.action.as_deref(),
+            Some("review-checkout\t9083\t9083-fix-it")
+        );
     }
 
     /// Every one of these read the *other* sidebar's selection before the queue
@@ -1518,7 +1551,10 @@ mod delete_tests {
             }],
         }];
         a.pane = Pane::Workstreams;
-        handle_key(&mut a, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        handle_key(
+            &mut a,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
         a
     }
 
@@ -1708,7 +1744,9 @@ mod select_tests {
     #[test]
     fn cwd_derived_selection_does_not_take_focus() {
         // Ask from inside a real workstream; the fallback is the cwd.
-        let dir = discover::projects_root().join("react-19").join("react-query");
+        let dir = discover::projects_root()
+            .join("react-19")
+            .join("react-query");
         if !dir.is_dir() {
             return; // nothing to assert against on a machine without it
         }
@@ -1796,7 +1834,11 @@ mod copy_tests {
         let n = a.copy_menu.as_ref().unwrap().items.len();
         assert!(n > 1);
         handle_key(&mut a, key('k'));
-        assert_eq!(a.copy_menu.as_ref().unwrap().idx, n - 1, "k wraps to the end");
+        assert_eq!(
+            a.copy_menu.as_ref().unwrap().idx,
+            n - 1,
+            "k wraps to the end"
+        );
         handle_key(&mut a, key('j'));
         assert_eq!(a.copy_menu.as_ref().unwrap().idx, 0);
     }
@@ -1879,7 +1921,11 @@ mod github_menu_tests {
             project: "p".into(),
             name: "w".into(),
             path: Some(std::path::PathBuf::from("/tmp/w")),
-            git: GitState { branch: "p/w".into(), remote_branch: "brian/p/w".into(), ..Default::default() },
+            git: GitState {
+                branch: "p/w".into(),
+                remote_branch: "brian/p/w".into(),
+                ..Default::default()
+            },
             merged: Merged::No,
             pr,
         }

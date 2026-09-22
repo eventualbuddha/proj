@@ -93,11 +93,25 @@ pub struct CopyMenu {
 
 impl CopyMenu {
     pub fn copy(items: Vec<CopyItem>) -> Self {
-        CopyMenu { items, idx: 0, kind: MenuKind::Copy, title: " copy ".into(), loading: false, pending: None }
+        CopyMenu {
+            items,
+            idx: 0,
+            kind: MenuKind::Copy,
+            title: " copy ".into(),
+            loading: false,
+            pending: None,
+        }
     }
 
     pub fn github(items: Vec<CopyItem>) -> Self {
-        CopyMenu { items, idx: 0, kind: MenuKind::Github, title: " github ".into(), loading: false, pending: None }
+        CopyMenu {
+            items,
+            idx: 0,
+            kind: MenuKind::Github,
+            title: " github ".into(),
+            loading: false,
+            pending: None,
+        }
     }
 
     pub fn reviewer(pending: String) -> Self {
@@ -186,9 +200,7 @@ impl CopyMenu {
             if let Some(c) = pr.checks.ci_url() {
                 if !c.url.is_empty() {
                     let label = if c.failed { "CI ✗" } else { "CI" };
-                    items.push(
-                        CopyItem::new(label, c.url.clone()).with_note(short_job(&c.name)),
-                    );
+                    items.push(CopyItem::new(label, c.url.clone()).with_note(short_job(&c.name)));
                 }
             }
             items.push(CopyItem::new("PR number", format!("#{}", pr.number)));
@@ -235,7 +247,9 @@ impl CopyMenu {
             None => items.push(
                 CopyItem::new(
                     "open a PR",
-                    format!("https://github.com/votingworks/vxsuite/compare/main...{remote}?expand=1"),
+                    format!(
+                        "https://github.com/votingworks/vxsuite/compare/main...{remote}?expand=1"
+                    ),
                 )
                 .with_note("copies the compare url"),
             ),
@@ -248,9 +262,12 @@ impl CopyMenu {
                         .with_action(format!("ready:{n}")),
                 );
                 items.push(
-                    CopyItem::new("mark ready, request review", format!("gh pr ready {n} && gh pr edit {n} --add-reviewer …"))
-                        .with_action(format!("ready-review:{n}"))
-                        .with_note("asks who"),
+                    CopyItem::new(
+                        "mark ready, request review",
+                        format!("gh pr ready {n} && gh pr edit {n} --add-reviewer …"),
+                    )
+                    .with_action(format!("ready-review:{n}"))
+                    .with_note("asks who"),
                 );
             } else {
                 items.push(
@@ -594,7 +611,9 @@ impl App {
         if branches == self.sent_branches {
             return;
         }
-        d.send(Req::Branches { branches: branches.clone() });
+        d.send(Req::Branches {
+            branches: branches.clone(),
+        });
         self.sent_branches = branches;
     }
 
@@ -767,7 +786,10 @@ impl App {
                 Msg::Reviewers(logins) => {
                     if let Some(m) = &mut self.copy_menu {
                         m.loading = false;
-                        m.items = logins.into_iter().map(|l| CopyItem::new(l.clone(), l)).collect();
+                        m.items = logins
+                            .into_iter()
+                            .map(|l| CopyItem::new(l.clone(), l))
+                            .collect();
                     }
                 }
                 Msg::Daemon(handle) => {
@@ -840,7 +862,9 @@ impl App {
     }
 
     pub fn project(&self) -> Option<&Project> {
-        self.visible().get(self.project_idx).map(|&i| &self.projects[i])
+        self.visible()
+            .get(self.project_idx)
+            .map(|&i| &self.projects[i])
     }
 
     pub fn workstream(&self) -> Option<&Workstream> {
@@ -1011,7 +1035,10 @@ impl App {
             focus,
         } = target;
         let visible = self.visible();
-        let Some(i) = visible.iter().position(|&i| self.projects[i].slug == project) else {
+        let Some(i) = visible
+            .iter()
+            .position(|&i| self.projects[i].slug == project)
+        else {
             return;
         };
         self.project_idx = i;
@@ -1030,7 +1057,9 @@ impl App {
     }
 
     fn restore_selection(&mut self, sel: Option<(String, String)>) {
-        let Some((project, workstream)) = sel else { return };
+        let Some((project, workstream)) = sel else {
+            return;
+        };
         let visible = self.visible();
         if let Some(i) = visible
             .iter()

@@ -240,8 +240,11 @@ pub fn scan() -> Result<Vec<Project>> {
     for p in &mut projects {
         // Virtual rows sort after materialized ones, then by name: the things
         // you can act on directly come first.
-        p.workstreams
-            .sort_by(|a, b| a.is_virtual().cmp(&b.is_virtual()).then(a.name.cmp(&b.name)));
+        p.workstreams.sort_by(|a, b| {
+            a.is_virtual()
+                .cmp(&b.is_virtual())
+                .then(a.name.cmp(&b.name))
+        });
     }
 
     Ok(projects)
@@ -293,8 +296,7 @@ fn claim(projects: &[Project], branch: &str) -> Option<usize> {
             }
         }
         if let Some(prefix) = &p.branch_prefix {
-            if branch.starts_with(prefix.as_str())
-                && best.is_none_or(|(_, len)| prefix.len() > len)
+            if branch.starts_with(prefix.as_str()) && best.is_none_or(|(_, len)| prefix.len() > len)
             {
                 best = Some((i, prefix.len()));
             }

@@ -174,7 +174,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                             Style::default()
                         },
                     ),
-                    Span::styled(format!("  {}", truncate(&b.branch, 40)), Style::default().fg(DIM)),
+                    Span::styled(
+                        format!("  {}", truncate(&b.branch, 40)),
+                        Style::default().fg(DIM),
+                    ),
                 ]));
             }
             text.push(Line::from(""));
@@ -209,7 +212,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let mut text = vec![Line::from("")];
         if menu.loading {
             text.push(Line::from(vec![
-                Span::styled(format!("  {}", spinner()), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("  {}", spinner()),
+                    Style::default().fg(Color::Yellow),
+                ),
                 Span::styled("  finding reviewers", Style::default().fg(DIM)),
             ]));
         }
@@ -398,10 +404,7 @@ fn draw_reviews(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|r| {
             let mut head = vec![
-                Span::styled(
-                    format!("#{} ", r.number),
-                    Style::default().fg(Color::Cyan),
-                ),
+                Span::styled(format!("#{} ", r.number), Style::default().fg(Color::Cyan)),
                 Span::styled(r.checks.state.glyph(), check_style(r.checks.state)),
                 Span::styled(
                     format!(" {}", r.reason.label()),
@@ -517,7 +520,10 @@ fn draw_review_detail(f: &mut Frame, app: &mut App, area: Rect) {
             Span::raw(p.display().to_string()),
         ]),
         None => Line::from(vec![
-            Span::styled(format!("{MISSING_WORKTREE_ICON}  "), Style::default().fg(DIM)),
+            Span::styled(
+                format!("{MISSING_WORKTREE_ICON}  "),
+                Style::default().fg(DIM),
+            ),
             Span::styled(
                 "not checked out — ↵ fetches it and builds",
                 Style::default().fg(DIM),
@@ -557,10 +563,7 @@ fn draw_review_detail(f: &mut Frame, app: &mut App, area: Rect) {
     ]));
 
     let title = format!("#{}", r.number);
-    f.render_widget(
-        Paragraph::new(lines).block(border(&title, false)),
-        area,
-    );
+    f.render_widget(Paragraph::new(lines).block(border(&title, false)), area);
     app.url_row = Some(url_row);
 }
 
@@ -609,7 +612,10 @@ fn draw_workstreams(f: &mut Frame, app: &mut App, area: Rect) {
 
             let flags = {
                 let mut s = String::new();
-                if w.pr.as_ref().is_some_and(|p| p.base != "main" && !p.base.is_empty()) {
+                if w.pr
+                    .as_ref()
+                    .is_some_and(|p| p.base != "main" && !p.base.is_empty())
+                {
                     s.push_str("󰡱 stacked ");
                 }
                 if w.merged.is_merged() {
@@ -630,7 +636,14 @@ fn draw_workstreams(f: &mut Frame, app: &mut App, area: Rect) {
 
             let name_cell = Cell::from(Line::from(vec![
                 Span::styled(
-                    format!("{} ", if w.is_virtual() { MISSING_WORKTREE_ICON } else { WORKTREE_ICON }),
+                    format!(
+                        "{} ",
+                        if w.is_virtual() {
+                            MISSING_WORKTREE_ICON
+                        } else {
+                            WORKTREE_ICON
+                        }
+                    ),
                     if w.is_virtual() {
                         Style::default().fg(Color::Yellow)
                     } else {
@@ -730,7 +743,14 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
 
     lines.push(Line::from(vec![
         Span::styled(
-            format!("{}  ", if w.is_virtual() { MISSING_WORKTREE_ICON } else { PATH_ICON }),
+            format!(
+                "{}  ",
+                if w.is_virtual() {
+                    MISSING_WORKTREE_ICON
+                } else {
+                    PATH_ICON
+                }
+            ),
             Style::default().fg(DIM),
         ),
         match &w.path {
@@ -745,10 +765,13 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     ]));
 
     let upstream = match &w.git.upstream {
-        Some(u) => format!("{u}{}", match w.git.unpushed {
-            Some(0) | None => String::new(),
-            Some(n) => format!(" ({n} unpushed)"),
-        }),
+        Some(u) => format!(
+            "{u}{}",
+            match w.git.unpushed {
+                Some(0) | None => String::new(),
+                Some(n) => format!(" ({n} unpushed)"),
+            }
+        ),
         None => "none — never pushed".to_string(),
     };
     lines.push(Line::from(vec![
@@ -758,7 +781,10 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
 
     lines.push(Line::from(vec![
         Span::styled("󰇷  ", Style::default().fg(DIM)),
-        Span::raw(format!("↑{} ahead  ↓{} behind main", w.git.ahead, w.git.behind)),
+        Span::raw(format!(
+            "↑{} ahead  ↓{} behind main",
+            w.git.ahead, w.git.behind
+        )),
         Span::styled(
             match w.merged {
                 Merged::No => String::new(),
@@ -767,7 +793,9 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
                 // Spell this one out. "Squashed" is the difference between "the
                 // code is in main" and "GitHub says so", and a reader who does
                 // not know that will read it as a warning.
-                Merged::Equivalent => "   squashed into main (same patches, rewritten history)".into(),
+                Merged::Equivalent => {
+                    "   squashed into main (same patches, rewritten history)".into()
+                }
             },
             Style::default().fg(Color::Magenta),
         ),
@@ -776,10 +804,7 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some(op) = &w.git.op {
         lines.push(Line::from(vec![
             Span::styled(format!("{OP_ICON}  "), Style::default().fg(Color::Yellow)),
-            Span::styled(
-                op.label(),
-                Style::default().fg(Color::Yellow).bold(),
-            ),
+            Span::styled(op.label(), Style::default().fg(Color::Yellow).bold()),
             Span::styled(
                 "  — HEAD is detached until this finishes".to_string(),
                 Style::default().fg(DIM),
@@ -814,11 +839,17 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
             app.url_row = Some(area.y + 1 + lines.len() as u16);
             lines.push(Line::from(vec![
                 Span::styled("   ", Style::default().fg(DIM)),
-                Span::styled(pr.url.clone(), Style::default().fg(Color::Blue).underlined()),
+                Span::styled(
+                    pr.url.clone(),
+                    Style::default().fg(Color::Blue).underlined(),
+                ),
             ]));
             let who = reviewer_spans(&pr.reviewers, pr.review_decision.as_deref());
             if !who.is_empty() {
-                let mut l = vec![Span::styled(format!("{REVIEW_ICON}  "), Style::default().fg(DIM))];
+                let mut l = vec![Span::styled(
+                    format!("{REVIEW_ICON}  "),
+                    Style::default().fg(DIM),
+                )];
                 l.extend(who);
                 lines.push(Line::from(l));
             }
@@ -864,10 +895,7 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
         ])),
     }
 
-    f.render_widget(
-        Paragraph::new(lines).block(border(&w.name, false)),
-        area,
-    );
+    f.render_widget(Paragraph::new(lines).block(border(&w.name, false)), area);
 }
 
 /// Who is reviewing, and what they said.
@@ -889,9 +917,7 @@ fn reviewer_spans(reviewers: &[Reviewer], decision: Option<&str>) -> Vec<Span<'s
         let (verb, style) = match r.state {
             ReviewerState::Pending => ("reviewing", Style::default().fg(Color::Yellow)),
             ReviewerState::Approved => ("approved", Style::default().fg(Color::Green)),
-            ReviewerState::ChangesRequested => {
-                ("wants changes", Style::default().fg(Color::Red))
-            }
+            ReviewerState::ChangesRequested => ("wants changes", Style::default().fg(Color::Red)),
             ReviewerState::Commented => ("commented", Style::default().fg(DIM)),
         };
         out.push(Span::styled(format!("@{} ", r.login), Style::default()));
@@ -977,11 +1003,17 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Yellow),
         )
     } else if let Some(e) = &app.error {
-        Span::styled(format!("  {}", truncate(e, 40)), Style::default().fg(Color::Red))
+        Span::styled(
+            format!("  {}", truncate(e, 40)),
+            Style::default().fg(Color::Red),
+        )
     } else {
         match app.fetched_at {
             Some(t) => Span::styled(format!("  github {}", ago(t)), Style::default().fg(DIM)),
-            None => Span::styled("  no github data".to_string(), Style::default().fg(Color::Yellow)),
+            None => Span::styled(
+                "  no github data".to_string(),
+                Style::default().fg(Color::Yellow),
+            ),
         }
     };
     spans.push(status);

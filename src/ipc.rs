@@ -24,11 +24,17 @@ use crate::model::Check;
 pub enum Req {
     /// The branches this instance wants PR state for. Sent whenever the scan
     /// changes them; the daemon queries the union over every instance.
-    Branches { branches: Vec<String> },
+    Branches {
+        branches: Vec<String>,
+    },
     /// Fetch now, whatever the timer thinks.
     Refresh,
-    Contexts { number: u32 },
-    Reviewers { number: u32 },
+    Contexts {
+        number: u32,
+    },
+    Reviewers {
+        number: u32,
+    },
     Status,
     Stop,
 }
@@ -38,13 +44,26 @@ pub enum Req {
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Res {
     /// The whole GitHub cache, pushed on connect and after every fetch.
-    Cache { cache: Box<Cache> },
+    Cache {
+        cache: Box<Cache>,
+    },
     /// Whether a fetch is in flight, so the spinner means something.
-    Fetching { on: bool },
-    Failed { message: String },
-    Contexts { number: u32, checks: Vec<WireCheck> },
-    Reviewers { logins: Vec<String> },
-    Status { text: String },
+    Fetching {
+        on: bool,
+    },
+    Failed {
+        message: String,
+    },
+    Contexts {
+        number: u32,
+        checks: Vec<WireCheck>,
+    },
+    Reviewers {
+        logins: Vec<String>,
+    },
+    Status {
+        text: String,
+    },
 }
 
 /// `Check` with serde on it. Its own type rather than a derive on the model, for
@@ -59,13 +78,21 @@ pub struct WireCheck {
 
 impl From<&Check> for WireCheck {
     fn from(c: &Check) -> Self {
-        WireCheck { name: c.name.clone(), url: c.url.clone(), failed: c.failed }
+        WireCheck {
+            name: c.name.clone(),
+            url: c.url.clone(),
+            failed: c.failed,
+        }
     }
 }
 
 impl From<WireCheck> for Check {
     fn from(c: WireCheck) -> Self {
-        Check { name: c.name, url: c.url, failed: c.failed }
+        Check {
+            name: c.name,
+            url: c.url,
+            failed: c.failed,
+        }
     }
 }
 
