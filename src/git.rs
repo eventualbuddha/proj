@@ -240,9 +240,7 @@ pub fn fetch_prune(repo: &Path) -> Result<()> {
 /// The name this branch has on the remote.
 ///
 /// Prefer the configured upstream, which is the truth once the branch has been
-/// pushed. Fall back to the convention -- prepend the handle -- so a branch that
-/// has never been pushed still matches a PR if one somehow exists, and so `proj`
-/// can say what it *would* push to.
+/// pushed. Fall back to the local name, which is what `proj` would push to.
 pub fn remote_name(branch: &str, upstream: Option<&str>, configured: Option<&str>) -> String {
     // `branch.<name>.merge`, a full ref. Preferred over the tracking ref because
     // it is still there once the remote branch is gone.
@@ -258,15 +256,8 @@ pub fn remote_name(branch: &str, upstream: Option<&str>, configured: Option<&str
             return rest.to_string();
         }
     }
-    if branch.starts_with(HANDLE) {
-        branch.to_string()
-    } else {
-        format!("{HANDLE}{branch}")
-    }
+    branch.to_string()
 }
-
-/// The remote-side namespace for this user's branches.
-pub const HANDLE: &str = "brian/";
 
 /// Answer the merged question four ways, cheapest and most trustworthy first.
 ///
@@ -533,10 +524,10 @@ mod tests {
     }
 
     #[test]
-    fn without_either_it_falls_back_to_the_handle() {
-        assert_eq!(remote_name("p/w", None, None), "brian/p/w");
+    fn without_either_it_falls_back_to_the_local_name() {
+        assert_eq!(remote_name("p/w", None, None), "p/w");
         assert_eq!(remote_name("brian/p/w", None, None), "brian/p/w");
         // A config entry that is not a branch ref says nothing useful.
-        assert_eq!(remote_name("p/w", None, Some("refs/heads/")), "brian/p/w");
+        assert_eq!(remote_name("p/w", None, Some("refs/heads/")), "p/w");
     }
 }

@@ -57,11 +57,10 @@ pub struct GitState {
     // No stash count: `refs/stash` is shared by every worktree of a repo, so a
     // per-row number would be the same everywhere and mean nothing about the row.
     pub upstream: Option<String>,
-    /// What this branch is called on the remote. Local branches are
-    /// `<project>/<workstream>`; the remote keeps the `brian/` handle
-    /// namespace, because that is what tells your branches from a teammate's on
-    /// a shared repo. GitHub only ever knows the remote name, so every PR
-    /// lookup has to go through this rather than through `branch`.
+    /// What this branch is called on the remote. Usually the same as `branch`,
+    /// but older branches were pushed under `brian/`. GitHub only ever knows
+    /// the remote name, so every PR lookup has to go through this rather than
+    /// through `branch`.
     pub remote_branch: String,
     /// Commits not pushed to the upstream. `None` when there is no upstream.
     pub unpushed: Option<u32>,

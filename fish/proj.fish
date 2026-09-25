@@ -104,8 +104,8 @@ function __proj_help
     echo "  daemon [status|stop]                    The shared fetcher behind every open dashboard"
     echo "  help                                    Show this help"
     echo ""
-    echo "Branches are named <project>/<workstream> locally and brian/<project>/<workstream>"
-    echo "on the remote, so a branch name and a directory path say the same thing."
+    echo "Branches are named <project>/<workstream>, locally and on the remote, so a"
+    echo "branch name and a directory path say the same thing."
 end
 
 # ---------------------------------------------------------------------------
@@ -369,9 +369,9 @@ function __proj_push --description "Push WORKTREE's branch to its remote name, s
     end
 
     # An explicit refspec, because local and remote names differ by design:
-    # `<project>/<workstream>` here, `brian/<project>/<workstream>` there. A bare
-    # `git push` with push.autoSetupRemote would create a same-named remote
-    # branch and quietly bypass the whole convention.
+    # Explicit, because a branch's remote name can differ from its local one
+    # (older branches were pushed under `brian/`), and `branch.<name>.merge` is
+    # what records it.
     echo "Pushing '$branch' to origin/$remote_branch..."
     git -C "$wt_path" push $force origin "$branch:refs/heads/$remote_branch"
     or return 1
@@ -736,8 +736,8 @@ function __proj_new
         return 1
     end
 
-    # The branch name IS the workstream's identity: `<project>/<workstream>`
-    # locally, `brian/<project>/<workstream>` on the remote. Nothing to configure
+    # The branch name IS the workstream's identity: `<project>/<workstream>`,
+    # locally and on the remote. Nothing to configure
     # and nothing to guess -- a path and a branch name carry the same
     # information, in both directions.
     if test -z "$branch_name"
@@ -774,7 +774,9 @@ function __proj_new
             end
 
             echo "Creating branch '$branch_name' from $start at $wt_path..."
-            set git_args -b "$branch_name" "$wt_path" "$start"
+            # `--no-track`: the base is where the branch starts, not where it
+            # pushes; `proj push` sets the real upstream.
+            set git_args --no-track -b "$branch_name" "$wt_path" "$start"
         end
     end
 
