@@ -165,7 +165,8 @@ pub fn scan() -> Result<Vec<Project>> {
             .collect();
         sub.sort_by_key(|e| e.file_name());
 
-        for ws in sub {
+        let slug = project.slug.clone();
+        project.workstreams = git::par_map(sub, |ws| {
             let path = ws.path();
             let name = ws.file_name().to_string_lossy().to_string();
 
@@ -183,15 +184,15 @@ pub fn scan() -> Result<Vec<Project>> {
             let mut git_state = git::state(&path, &branch, &base, true);
             git_state.op = op;
 
-            project.workstreams.push(Workstream {
-                project: project.slug.clone(),
+            Workstream {
+                project: slug.clone(),
                 name,
                 path: Some(path),
                 git: git_state,
                 merged: Merged::No,
                 pr: None,
-            });
-        }
+            }
+        });
 
         projects.push(project);
     }
@@ -201,15 +202,16 @@ pub fn scan() -> Result<Vec<Project>> {
     // split -- `brian/esm-lib-batch-4` is six commits and a draft PR with no
     // directory, and without this it renders nowhere.
     let checked_out: HashSet<&String> = worktrees.keys().collect();
-    for (branch, _sha) in &branches {
-        if checked_out.contains(branch) {
-            continue;
-        }
+    let orphans: Vec<&String> = branches
+        .iter()
+        .map(|(branch, _sha)| branch)
         // `main` is the base, not a workstream.
-        if branch == "main" {
-            continue;
-        }
-
+        .filter(|b| !checked_out.contains(b) && *b != "main")
+        .collect();
+    let states = git::par_map(orphans, |branch| {
+        (branch, git::state(&repo, branch, &base, false))
+    });
+    for (branch, git_state) in states {
         // No project claims it -- but dropping it here is exactly the blindness
         // this tool exists to remove, so it goes to a synthetic "unfiled"
         // project instead. An unfiled row is a prompt: file it, or delete it.
@@ -218,7 +220,6 @@ pub fn scan() -> Result<Vec<Project>> {
             None => unfiled(&mut projects),
         };
 
-        let git_state = git::state(&repo, branch, &base, false);
         let name = short_name(&projects[idx], branch);
         let slug = projects[idx].slug.clone();
         projects[idx].workstreams.push(Workstream {

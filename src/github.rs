@@ -22,8 +22,9 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::*;
@@ -174,88 +175,58 @@ fn gh(args: &[String]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// `git fetch` and the API refresh, side by side. They share nothing but a
+/// network connection, and the fetch is a second or two that the PR state
+/// would otherwise sit behind.
+pub fn fetch_and_refresh(
+    repo: &Path,
+    owner: &str,
+    name: &str,
+    branches: &[String],
+) -> Result<Cache> {
+    std::thread::scope(|s| {
+        // Failure is not fatal: offline, the local answer is still worth
+        // showing, and the API call fails on its own terms.
+        s.spawn(|| {
+            let _ = crate::git::fetch_prune(repo);
+        });
+        refresh(owner, name, branches)
+    })
+}
+
 /// Hit the API and rewrite the cache. Slow enough to belong on a background
 /// thread; `branches` are *remote* names, since `headRefName` is the only name
 /// GitHub knows.
 pub fn refresh(owner: &str, name: &str, branches: &[String]) -> Result<Cache> {
-    let mut prs = Vec::new();
-
     // Chunked because the query grows with the branch count and a variable list
-    // is not free. lazygit uses 10 per request with 5 concurrent; sequential
-    // chunks of 20 are well inside what the API is happy with here, and this
-    // already runs off the UI thread.
-    for chunk in branches.chunks(20) {
-        let (query, vars) = list_query(chunk);
-        let mut args: Vec<String> = vec![
-            "api".into(),
-            "graphql".into(),
-            "-f".into(),
-            format!("query={query}"),
-        ];
-        for (k, v) in vars {
-            let value = match k.as_str() {
-                "owner" => owner.to_string(),
-                "repo" => name.to_string(),
-                _ => v,
-            };
-            args.push("-F".into());
-            args.push(format!("{k}={value}"));
-        }
+    // is not free. lazygit uses 10 per request with 5 concurrent; chunks of 20
+    // are well inside what the API is happy with here. Every chunk and the
+    // review queue go out at once: each is a second of waiting on GitHub, and
+    // in series they were the whole of a fetch.
+    let (chunks, reviews) = std::thread::scope(|s| {
+        let chunks: Vec<_> = branches
+            .chunks(20)
+            .map(|chunk| s.spawn(move || pr_chunk(owner, name, chunk)))
+            .collect();
+        // The review queue rides along on the same cycle. A failure here is
+        // not a failure of the whole refresh -- an empty queue and an
+        // unreachable one look the same on screen, but losing the workstream
+        // PRs too would be worse.
+        let reviews = s.spawn(|| match viewer(owner) {
+            Ok((me, teams)) => review_queue(owner, name, &me, &teams).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        });
+        let chunks: Vec<Result<Vec<CachedPr>>> = chunks
+            .into_iter()
+            .map(|h| h.join().expect("a fetch thread panicked"))
+            .collect();
+        (chunks, reviews.join().expect("the review thread panicked"))
+    });
 
-        let body = gh(&args)?;
-        let v: serde_json::Value =
-            serde_json::from_slice(&body).context("parsing the graphql response")?;
-        let repo = &v["data"]["repository"];
-
-        for (i, branch) in chunk.iter().enumerate() {
-            let nodes = repo[format!("a{}", i + 1)]["nodes"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-
-            // Several forks can carry a PR with this head ref name; only the one
-            // in this repo's own owner is ours. Newest first, so the first match
-            // is the live PR for a branch reused across several.
-            let Some(node) = nodes
-                .iter()
-                .find(|n| n["headRepositoryOwner"]["login"].as_str() == Some(owner))
-            else {
-                continue;
-            };
-
-            let is_draft = node["isDraft"].as_bool().unwrap_or(false);
-            let state = node["state"].as_str().unwrap_or("OPEN");
-            // A closed PR whose branch was deleted has a null headRef, so the
-            // rollup has to be reached for defensively rather than indexed.
-            let rollup = &node["headRef"]["target"]["statusCheckRollup"];
-
-            prs.push(CachedPr {
-                branch: branch.clone(),
-                number: node["number"].as_u64().unwrap_or(0) as u32,
-                state: if is_draft && state == "OPEN" {
-                    "DRAFT".into()
-                } else {
-                    state.to_string()
-                },
-                title: node["title"].as_str().unwrap_or("").to_string(),
-                url: node["url"].as_str().unwrap_or("").to_string(),
-                author: node["author"]["login"].as_str().unwrap_or("").to_string(),
-                review_decision: node["reviewDecision"].as_str().map(str::to_string),
-                check_state: rollup["state"].as_str().unwrap_or("NONE").to_string(),
-                check_total: rollup["contexts"]["totalCount"].as_u64().unwrap_or(0) as u32,
-                base: node["baseRefName"].as_str().unwrap_or("main").to_string(),
-                reviewers: parse_reviewers(node),
-            });
-        }
+    let mut prs = Vec::new();
+    for chunk in chunks {
+        prs.extend(chunk?);
     }
-
-    // The review queue rides along on the same cycle. A failure here is not a
-    // failure of the whole refresh -- an empty queue and an unreachable one look
-    // the same on screen, but losing the workstream PRs too would be worse.
-    let reviews = match viewer(owner) {
-        Ok((me, teams)) => review_queue(owner, name, &me, &teams).unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
 
     let cache = Cache {
         fetched_at: now(),
@@ -264,6 +235,74 @@ pub fn refresh(owner: &str, name: &str, branches: &[String]) -> Result<Cache> {
     };
     save_cache(owner, name, &cache)?;
     Ok(cache)
+}
+
+/// One multi-branch query: the PR, if any, for each branch in `chunk`.
+fn pr_chunk(owner: &str, name: &str, chunk: &[String]) -> Result<Vec<CachedPr>> {
+    let (query, vars) = list_query(chunk);
+    let mut args: Vec<String> = vec![
+        "api".into(),
+        "graphql".into(),
+        "-f".into(),
+        format!("query={query}"),
+    ];
+    for (k, v) in vars {
+        let value = match k.as_str() {
+            "owner" => owner.to_string(),
+            "repo" => name.to_string(),
+            _ => v,
+        };
+        args.push("-F".into());
+        args.push(format!("{k}={value}"));
+    }
+
+    let body = gh(&args)?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&body).context("parsing the graphql response")?;
+    let repo = &v["data"]["repository"];
+
+    let mut prs = Vec::new();
+    for (i, branch) in chunk.iter().enumerate() {
+        let nodes = repo[format!("a{}", i + 1)]["nodes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+
+        // Several forks can carry a PR with this head ref name; only the one
+        // in this repo's own owner is ours. Newest first, so the first match
+        // is the live PR for a branch reused across several.
+        let Some(node) = nodes
+            .iter()
+            .find(|n| n["headRepositoryOwner"]["login"].as_str() == Some(owner))
+        else {
+            continue;
+        };
+
+        let is_draft = node["isDraft"].as_bool().unwrap_or(false);
+        let state = node["state"].as_str().unwrap_or("OPEN");
+        // A closed PR whose branch was deleted has a null headRef, so the
+        // rollup has to be reached for defensively rather than indexed.
+        let rollup = &node["headRef"]["target"]["statusCheckRollup"];
+
+        prs.push(CachedPr {
+            branch: branch.clone(),
+            number: node["number"].as_u64().unwrap_or(0) as u32,
+            state: if is_draft && state == "OPEN" {
+                "DRAFT".into()
+            } else {
+                state.to_string()
+            },
+            title: node["title"].as_str().unwrap_or("").to_string(),
+            url: node["url"].as_str().unwrap_or("").to_string(),
+            author: node["author"]["login"].as_str().unwrap_or("").to_string(),
+            review_decision: node["reviewDecision"].as_str().map(str::to_string),
+            check_state: rollup["state"].as_str().unwrap_or("NONE").to_string(),
+            check_total: rollup["contexts"]["totalCount"].as_u64().unwrap_or(0) as u32,
+            base: node["baseRefName"].as_str().unwrap_or("main").to_string(),
+            reviewers: parse_reviewers(node),
+        });
+    }
+    Ok(prs)
 }
 
 /// Reviewers GitHub suggests for a PR, plus anyone already requested.
@@ -385,15 +424,34 @@ fragment pr on PullRequest {
 }
 "#;
 
-/// ISO 8601 to unix seconds, by shelling out to `date`. Only the ordering
-/// matters here, and a date crate for one comparison is not worth the build.
+/// GitHub's `YYYY-MM-DDTHH:MM:SSZ` to unix seconds. Only the ordering matters
+/// here, and a date crate for one comparison is not worth the build.
 fn iso_to_unix(s: &str) -> i64 {
-    std::process::Command::new("date")
-        .args(["-u", "-d", s, "+%s"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-        .unwrap_or(0)
+    let mut parts = s
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse::<i64>().unwrap_or(0));
+    let (y, m, d) = (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    );
+    let (hh, mm, ss) = (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    );
+    if y == 0 || m == 0 || d == 0 {
+        return 0;
+    }
+    // Days since 1970-01-01 from a civil date (Howard Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    days * 86400 + hh * 3600 + mm * 60 + ss
 }
 
 /// Fetch the review queue. `teams` are org/team slugs you belong to.
@@ -488,8 +546,30 @@ pub fn review_queue(
     Ok(out)
 }
 
-/// Your login, and the teams you belong to within `owner`.
+/// How long a login and team list is believed. Team membership changes on
+/// the order of months; asking twice a minute was two `gh` calls a fetch.
+const VIEWER_TTL: u64 = 3600;
+
+static VIEWER: Mutex<Option<(u64, String, Vec<String>)>> = Mutex::new(None);
+
+/// Your login, and the teams you belong to within `owner`. Memoized for an
+/// hour; a failure is not remembered, so the next fetch asks again.
 pub fn viewer(owner: &str) -> Result<(String, Vec<String>)> {
+    if let Ok(memo) = VIEWER.lock() {
+        if let Some((at, me, teams)) = memo.as_ref() {
+            if now().saturating_sub(*at) < VIEWER_TTL {
+                return Ok((me.clone(), teams.clone()));
+            }
+        }
+    }
+    let (me, teams) = fetch_viewer(owner)?;
+    if let Ok(mut memo) = VIEWER.lock() {
+        *memo = Some((now(), me.clone(), teams.clone()));
+    }
+    Ok((me, teams))
+}
+
+fn fetch_viewer(owner: &str) -> Result<(String, Vec<String>)> {
     let me = String::from_utf8_lossy(&gh(&[
         "api".into(),
         "user".into(),
@@ -644,5 +724,19 @@ pub fn apply(projects: &mut [Project], cache: &Cache) {
                     .collect(),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_timestamps_parse_without_a_subprocess() {
+        assert_eq!(iso_to_unix("1970-01-01T00:00:00Z"), 0);
+        assert_eq!(iso_to_unix("2000-03-01T00:00:00Z"), 951_868_800);
+        assert_eq!(iso_to_unix("2026-10-07T12:34:56Z"), 1_791_376_496);
+        assert_eq!(iso_to_unix(""), 0);
+        assert!(iso_to_unix("2026-10-07T12:34:56Z") > iso_to_unix("2026-10-07T12:34:55Z"));
     }
 }

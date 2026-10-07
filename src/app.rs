@@ -529,8 +529,8 @@ impl App {
     }
 
     /// Scan on a thread: filesystem, git, then whatever GitHub state is already
-    /// cached, then merged-ness -- in that order, because merged-ness depends on
-    /// whether a PR says merged.
+    /// cached. Merged-ness follows in a pass of its own once this lands, since
+    /// it depends on whether a PR says merged.
     /// `show_loading` only on the first scan. A periodic one must not throw a
     /// modal over a screen you are reading.
     pub fn start_scan(&mut self, show_loading: bool) {
@@ -546,8 +546,11 @@ impl App {
             if let Some(cache) = github::load_cache(OWNER, REPO) {
                 github::apply(&mut projects, &cache);
             }
-            compute_merged(&mut projects);
-            crate::cache::save(&projects);
+            // Merged-ness is not computed here: it is the slow half, the
+            // handler carries last pass's answers across, and it starts a
+            // fresh pass as soon as this lands. Making the rows wait on it
+            // was the difference between a scan that draws in under a second
+            // and one that draws in ten.
             let _ = tx.send(Msg::Scanned(projects));
         });
     }
@@ -634,11 +637,8 @@ impl App {
         let branches = self.branches();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            // Fetch first, so "behind main" and the remote-tracking refs are as
-            // current as the PR state landing beside them. Failure is not fatal:
-            // offline, the local answer is still worth showing.
-            let _ = git::fetch_prune(&discover::repo_path());
-            let msg = match github::refresh(OWNER, REPO, &branches) {
+            let repo = discover::repo_path();
+            let msg = match github::fetch_and_refresh(&repo, OWNER, REPO, &branches) {
                 Ok(cache) => Msg::Refreshed(Box::new(cache)),
                 Err(e) => Msg::RefreshFailed(format!("{e:#}")),
             };
@@ -777,6 +777,9 @@ impl App {
                             }
                         }
                     }
+                    // The snapshot waits for this so the next launch draws
+                    // merged rows as merged, not as `No` until its own pass.
+                    crate::cache::save(&self.projects);
                 }
                 Msg::RefreshFailed(e) => {
                     self.refreshing = false;
@@ -975,25 +978,33 @@ impl App {
 pub fn merged_for(rows: &[(String, Option<PathBuf>, bool)]) -> Vec<(String, Merged)> {
     let repo = discover::repo_path();
     let base = git::base_ref(&repo);
-    rows.iter()
-        .map(|(branch, path, pr_merged)| {
-            let dir = path.clone().unwrap_or_else(|| repo.clone());
-            (branch.clone(), git::merged(&dir, branch, &base, *pr_merged))
-        })
-        .collect()
+    git::par_map(rows.iter().collect(), |(branch, path, pr_merged)| {
+        let dir = path.clone().unwrap_or_else(|| repo.clone());
+        (branch.clone(), git::merged(&dir, branch, &base, *pr_merged))
+    })
 }
 
 /// Merged-ness for every row. Depends on the PR answer, so it must run *after*
 /// GitHub state is applied -- before it, every squash-merged branch reports open.
 pub fn compute_merged(projects: &mut [Project]) {
-    let repo = discover::repo_path();
-    let base = git::base_ref(&repo);
-    for p in projects.iter_mut() {
-        for w in p.workstreams.iter_mut() {
-            let dir = w.path.clone().unwrap_or_else(|| repo.clone());
-            let pr_merged = w.pr.as_ref().is_some_and(|pr| pr.state == PrState::Merged);
-            w.merged = git::merged(&dir, &w.git.branch, &base, pr_merged);
-        }
+    let rows: Vec<(String, Option<PathBuf>, bool)> = projects
+        .iter()
+        .flat_map(|p| p.workstreams.iter())
+        .map(|w| {
+            (
+                w.git.branch.clone(),
+                w.path.clone(),
+                w.pr.as_ref().is_some_and(|pr| pr.state == PrState::Merged),
+            )
+        })
+        .collect();
+    let answers = merged_for(&rows);
+    for (w, (_, m)) in projects
+        .iter_mut()
+        .flat_map(|p| p.workstreams.iter_mut())
+        .zip(answers)
+    {
+        w.merged = m;
     }
 }
 

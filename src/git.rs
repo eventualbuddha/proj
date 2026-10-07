@@ -59,7 +59,36 @@ pub fn base_ref(repo: &Path) -> String {
 /// nameless worktree and once as a branch with no worktree, and neither row is
 /// true. Reading the sequencer state is what puts the name back.
 pub fn in_progress(dir: &Path) -> Option<Op> {
-    let git_path = |name: &str| ok(dir, &["rev-parse", "--git-path", name]).map(PathBuf::from);
+    // One `rev-parse` for every marker, since each `--git-path` answers on its
+    // own line; asking one at a time was six processes per worktree per scan.
+    const MARKERS: [&str; 6] = [
+        "rebase-merge",
+        "rebase-apply",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+    ];
+    let mut args = vec!["rev-parse"];
+    for m in MARKERS {
+        args.push("--git-path");
+        args.push(m);
+    }
+    let out = ok(dir, &args)?;
+    let paths: Vec<PathBuf> = out.lines().map(PathBuf::from).collect();
+    if paths.len() != MARKERS.len() {
+        return None;
+    }
+    let git_path = |name: &str| {
+        let i = MARKERS.iter().position(|m| *m == name)?;
+        let p = &paths[i];
+        // `--git-path` answers relative to the worktree unless it is absolute.
+        Some(if p.is_absolute() {
+            p.clone()
+        } else {
+            dir.join(p)
+        })
+    };
 
     // rebase-merge is the interactive/merge backend, rebase-apply the am one.
     for (name, kind) in [
@@ -318,9 +347,9 @@ pub fn merged(dir: &Path, branch: &str, base: &str, pr_merged: bool) -> Merged {
     }
 }
 
-/// The patch-id of a diff produced by `git <args>`, as `git patch-id --stable`
-/// computes it.
-fn patch_id(dir: &Path, args: &[&str]) -> Option<String> {
+/// Run `git <args>` and pipe its output through `git patch-id --stable`,
+/// returning the lines it prints: `<patch-id> <commit-id>`, one per patch.
+fn patch_ids(dir: &Path, args: &[&str]) -> Option<String> {
     let diff = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -340,14 +369,55 @@ fn patch_id(dir: &Path, args: &[&str]) -> Option<String> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    // The answer is one short line, so the pipe cannot fill while `git
-    // patch-id` is still reading its input.
-    child.stdin.take()?.write_all(&diff.stdout).ok()?;
+    // A writer thread, because the output is one line per commit and enough
+    // commits would fill the stdout pipe while we are still writing stdin.
+    let mut stdin = child.stdin.take()?;
+    let input = diff.stdout;
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
     let out = child.wait_with_output().ok()?;
+    let _ = writer.join();
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
 
-    let text = String::from_utf8_lossy(&out.stdout);
+/// The patch-id of a diff produced by `git <args>`.
+fn patch_id(dir: &Path, args: &[&str]) -> Option<String> {
+    let text = patch_ids(dir, args)?;
     let id = text.split_whitespace().next()?;
     (!id.is_empty()).then(|| id.to_string())
+}
+
+/// The files each commit touched, as `(sha, files)`, in one `diff-tree`.
+fn files_touched(dir: &Path, shas: &[&str]) -> Vec<(String, Vec<String>)> {
+    let Ok(mut child) = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["diff-tree", "--stdin", "-r", "-M", "--name-only"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return Vec::new();
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        return Vec::new();
+    };
+    let input = shas.iter().map(|s| format!("{s}\n")).collect::<String>();
+    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let Ok(out) = child.wait_with_output() else {
+        return Vec::new();
+    };
+    let _ = writer.join();
+
+    // One block per commit: the sha, its files, a blank line.
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut result = Vec::new();
+    for block in text.split("\n\n") {
+        let mut lines = block.lines().filter(|l| !l.is_empty());
+        let Some(sha) = lines.next() else { continue };
+        result.push((sha.to_string(), lines.map(str::to_string).collect()));
+    }
+    result
 }
 
 /// Whether the branch landed on `base` as a single squashed commit.
@@ -368,17 +438,68 @@ fn squashed_into(dir: &Path, branch: &str, base: &str) -> bool {
     // Only a commit that touched the same files can carry the same patch, and
     // on a busy `main` that is the difference between a handful of candidates
     // and every commit since the branch started.
-    let files = ok(dir, &["diff", "--name-only", &mb, branch]).unwrap_or_default();
+    let files = ok(dir, &["diff", "--name-only", "-M", &mb, branch]).unwrap_or_default();
+    let mut want_files: Vec<&str> = files.lines().collect();
+    want_files.sort_unstable();
     let range = format!("{mb}..{base}");
     let mut args = vec!["rev-list", &range, "--"];
-    args.extend(files.lines());
+    args.extend(want_files.iter().copied());
     let Some(candidates) = ok(dir, &args) else {
         return false;
     };
 
-    candidates
+    // A patch-id covers the file names too, so a commit that touched anything
+    // beyond the branch's files cannot match and is not worth diffing. This
+    // is what keeps a thousand-file lockfile bump on `main` from being hashed
+    // once per row that touched the lockfile.
+    let shas: Vec<&str> = candidates.lines().collect();
+    let same_files: Vec<String> = files_touched(dir, &shas)
+        .into_iter()
+        .filter_map(|(sha, mut touched)| {
+            touched.sort_unstable();
+            let same = touched
+                .iter()
+                .map(String::as_str)
+                .eq(want_files.iter().copied());
+            same.then_some(sha)
+        })
+        .collect();
+    if same_files.is_empty() {
+        return false;
+    }
+
+    // One `show` of every survivor, so `patch-id` answers for all of them in
+    // a single pass. The `commit` header line is what it splits on.
+    let mut args = vec!["show", "--format=commit %H"];
+    args.extend(same_files.iter().map(String::as_str));
+    patch_ids(dir, &args)
+        .unwrap_or_default()
         .lines()
-        .any(|sha| patch_id(dir, &["show", sha]).as_deref() == Some(want.as_str()))
+        .any(|l| l.split_whitespace().next() == Some(want.as_str()))
+}
+
+/// Run `f` over every item on its own thread and return the results in order.
+///
+/// Everything here is a `git` child process waiting on disk, so the rows are
+/// independent and the machine has cores to spare; walking them one at a time
+/// made a scan cost the sum of its rows instead of the slowest one.
+pub fn par_map<T, R, F>(items: Vec<T>, f: F) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+    F: Fn(T) -> R + Sync,
+{
+    let f = &f;
+    std::thread::scope(|s| {
+        let handles: Vec<_> = items
+            .into_iter()
+            .map(|item| s.spawn(move || f(item)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("a scan thread panicked"))
+            .collect()
+    })
 }
 
 /// Commits on `dir`'s HEAD that exist neither on `base` nor on a remote.

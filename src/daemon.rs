@@ -373,11 +373,8 @@ impl Daemon {
         let branches = self.branches.clone();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            // Fetch first, so "behind main" and the remote-tracking refs are as
-            // current as the PR state landing beside them. Failure is not fatal:
-            // offline, the local answer is still worth showing.
-            let _ = crate::git::fetch_prune(&crate::discover::repo_path());
-            let ev = match github::refresh(OWNER, REPO, &branches) {
+            let repo = crate::discover::repo_path();
+            let ev = match github::fetch_and_refresh(&repo, OWNER, REPO, &branches) {
                 Ok(cache) => Ev::Fetched(Box::new(cache)),
                 Err(e) => Ev::FetchFailed(format!("{e:#}")),
             };
