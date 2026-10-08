@@ -27,6 +27,7 @@ complete -c proj -n __proj_needs_command -a new -d "Create a workstream worktree
 complete -c proj -n __proj_needs_command -a add -d "Create a workstream worktree"
 complete -c proj -n __proj_needs_command -a rm -d "Remove a workstream"
 complete -c proj -n __proj_needs_command -a remove -d "Remove a workstream"
+complete -c proj -n __proj_needs_command -a archive -d "Move a project to ~/projects/ARCHIVE"
 complete -c proj -n __proj_needs_command -a ls -d "List projects and workstreams"
 complete -c proj -n __proj_needs_command -a list -d "List projects and workstreams"
 complete -c proj -n __proj_needs_command -a cd -d "Change to a project or workstream"
@@ -44,6 +45,9 @@ complete -c proj -n '__proj_using_command_any new add' -a '(proj __projects)'
 complete -c proj -n '__proj_using_command_any new add' -l branch -s b -d "Base branch for a new branch (default: main)" -x -a '(proj __branches)'
 complete -c proj -n '__proj_using_command_any new add' -l branch-name -s n -d "Branch name (default: from the project's branch-prefix)" -x -a '(proj __branches)'
 complete -c proj -n '__proj_using_command_any new add' -l rebase -d "Rebase on main before building"
+
+# archive — projects only
+complete -c proj -n '__proj_using_command_any archive' -a '(proj __projects)'
 
 # rm/remove — existing workstreams only
 complete -c proj -n '__proj_using_command_any rm remove' -a '(proj __workstreams)'

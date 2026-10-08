@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use app::{App, Confirm, CopyMenu, Pane, Select};
+use discover::UNFILED;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -387,6 +388,28 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         return false;
     }
 
+    // Naming a new project: the same deal, field by field.
+    if let Some(n) = &mut app.new_project {
+        match key.code {
+            // Back a field, and out from the first: esc steps back here as it
+            // does everywhere else.
+            KeyCode::Esc if n.field > 0 => n.field -= 1,
+            KeyCode::Esc => app.new_project = None,
+            KeyCode::BackTab if n.field > 0 => n.field -= 1,
+            KeyCode::Backspace => {
+                n.current().pop();
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                if app.new_project_next() {
+                    return create_project(app);
+                }
+            }
+            KeyCode::Char(c) => n.current().push(c),
+            _ => {}
+        }
+        return false;
+    }
+
     // The copy menu owns the keyboard while it is open.
     if let Some(menu) = &mut app.copy_menu {
         match key.code {
@@ -480,6 +503,8 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         // A workstream that does not exist yet, and so is on no row: the one
         // thing the dashboard could not reach until now.
         KeyCode::Char('n') => app.begin_new_workstream(),
+        // And a project that does not exist yet, which `n` needs first.
+        KeyCode::Char('N') => app.begin_new_project(),
 
         // Navigate and launch.
         KeyCode::Char('g') => {
@@ -530,6 +555,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         }
 
         KeyCode::Char('d') => confirm_delete(app),
+        KeyCode::Char('A') => confirm_archive(app),
         KeyCode::Char('r') => app.start_refresh(),
         KeyCode::Char('R') => app.start_scan(false),
         KeyCode::Char('a') => {
@@ -921,6 +947,62 @@ fn create_workstream(app: &mut App) -> bool {
     emit(app, format!("new\t{qualified}\t{branch}\t{base}"))
 }
 
+/// Hand the shell a project to create: its directory, and the frontmatter its
+/// README opens with. `repos` and `status` take their defaults; the README is
+/// right there to edit for the rare project that needs otherwise.
+fn create_project(app: &mut App) -> bool {
+    let Some(n) = app.new_project.take() else {
+        return false;
+    };
+    emit(
+        app,
+        format!("new-project\t{}\t{}\t{}", n.slug, n.name, n.emoji),
+    )
+}
+
+/// Ask before moving a project to ARCHIVE.
+///
+/// A project with worktrees on disk is not offered: a worktree moved out from
+/// under the root is one the dashboard cannot see but git still lists, which is
+/// the exact blind spot this tool exists to close. `proj rm` them first.
+fn confirm_archive(app: &mut App) {
+    if app.sidebar == app::Sidebar::Reviews {
+        app.flash("switch to projects with [ to archive one");
+        return;
+    }
+    let Some(p) = app.project() else {
+        app.flash("no project selected");
+        return;
+    };
+    if p.slug == UNFILED {
+        app.flash("unfiled is not a project");
+        return;
+    }
+    let on_disk = p.workstreams.iter().filter(|w| !w.is_virtual()).count();
+    if on_disk > 0 {
+        app.flash(format!("remove its {on_disk} workstream(s) first (d)"));
+        return;
+    }
+    let virtual_rows = p.workstreams.len();
+    let (slug, name) = (p.slug.clone(), p.name.clone());
+
+    let mut body = vec![
+        format!("{} {name}", p.emoji),
+        format!("moves to ~/projects/ARCHIVE/{slug}"),
+    ];
+    if virtual_rows > 0 {
+        body.push(format!(
+            "{virtual_rows} branch(es) without a worktree will show as unfiled"
+        ));
+    }
+    app.confirm = Some(Confirm {
+        title: format!(" archive {slug} "),
+        body,
+        verb: format!("archive\t{slug}"),
+        yes: "archive",
+    });
+}
+
 /// Ask before removing a workstream, and say what is at stake.
 ///
 /// `proj rm` refuses on uncommitted work or on commits that exist nowhere else,
@@ -975,6 +1057,7 @@ fn confirm_delete(app: &mut App) {
         title: format!(" delete {qualified} "),
         body,
         verb: format!("delete\t{qualified}"),
+        yes: "delete",
     });
 }
 
@@ -1027,6 +1110,7 @@ fn confirm_delete_branch(app: &mut App) {
         // that has not run yet leaves `origin/<name>` there to delete, and the
         // remote side is checked before anything is pushed.
         verb: format!("delete-branch\t{qualified}\t{branch}\t{remote}"),
+        yes: "delete",
     });
 }
 
@@ -1058,6 +1142,7 @@ fn confirm_delete_review(app: &mut App) {
         title: format!(" delete the review checkout of #{number} "),
         body: vec![title, path.display().to_string()],
         verb: format!("delete\t{project}/{name}"),
+        yes: "delete",
     });
 }
 
@@ -1182,6 +1267,7 @@ mod tests {
             title: "t".into(),
             body: vec![],
             verb: "delete\tp/w".into(),
+            yes: "delete",
         });
         assert!(!handle_key(&mut a, esc()));
         assert!(a.confirm.is_none());
@@ -1383,6 +1469,155 @@ mod review_tests {
         let mut a = app(&[], Vec::new());
         assert!(!handle_key(&mut a, code(KeyCode::Enter)));
         assert!(a.action.is_none());
+    }
+}
+
+#[cfg(test)]
+mod new_project_tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    use model::*;
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+    fn code(c: KeyCode) -> KeyEvent {
+        KeyEvent::new(c, KeyModifiers::NONE)
+    }
+    fn type_in(a: &mut App, s: &str) {
+        for c in s.chars() {
+            handle_key(a, key(c));
+        }
+    }
+
+    fn project(slug: &str, workstreams: Vec<Workstream>) -> Project {
+        Project {
+            slug: slug.into(),
+            emoji: "⚛️".into(),
+            name: "React 19".into(),
+            kind: ProjectKind::Project,
+            status: "active".into(),
+            readme: std::path::PathBuf::from(format!("/tmp/{slug}/README.md")),
+            branch_prefix: None,
+            branch_globs: Vec::new(),
+            workstreams,
+        }
+    }
+
+    fn ws(path: Option<&str>) -> Workstream {
+        Workstream {
+            project: "react-19".into(),
+            name: "hooks".into(),
+            path: path.map(std::path::PathBuf::from),
+            git: GitState::default(),
+            merged: Merged::No,
+            pr: None,
+        }
+    }
+
+    fn app() -> App {
+        let mut a = App::new().expect("app");
+        a.loading = false;
+        a.projects = vec![project("react-19", vec![])];
+        a
+    }
+
+    #[test]
+    fn shift_n_walks_the_fields_and_emits_the_verb() {
+        let mut a = app();
+        handle_key(&mut a, key('N'));
+        type_in(&mut a, "deskpro");
+        handle_key(&mut a, code(KeyCode::Enter));
+        type_in(&mut a, "DeskPro scanner");
+        handle_key(&mut a, code(KeyCode::Tab));
+        type_in(&mut a, "📄");
+        assert!(handle_key(&mut a, code(KeyCode::Enter)), "creating quits");
+        assert_eq!(
+            a.action.as_deref(),
+            Some("new-project\tdeskpro\tDeskPro scanner\t📄")
+        );
+    }
+
+    #[test]
+    fn the_emoji_may_be_left_blank_but_not_the_rest() {
+        let mut a = app();
+        handle_key(&mut a, key('N'));
+        handle_key(&mut a, code(KeyCode::Enter));
+        assert_eq!(
+            a.new_project.as_ref().unwrap().field,
+            0,
+            "empty slug refused"
+        );
+        type_in(&mut a, "deskpro");
+        handle_key(&mut a, code(KeyCode::Enter));
+        handle_key(&mut a, code(KeyCode::Enter));
+        assert_eq!(
+            a.new_project.as_ref().unwrap().field,
+            1,
+            "empty name refused"
+        );
+        type_in(&mut a, "DeskPro");
+        handle_key(&mut a, code(KeyCode::Enter));
+        assert!(handle_key(&mut a, code(KeyCode::Enter)));
+        assert_eq!(a.action.as_deref(), Some("new-project\tdeskpro\tDeskPro\t"));
+    }
+
+    #[test]
+    fn a_directory_that_already_is_a_project_is_refused() {
+        for taken in ["react-19", "ARCHIVE", "a/b", "two words"] {
+            let mut a = app();
+            handle_key(&mut a, key('N'));
+            type_in(&mut a, taken);
+            handle_key(&mut a, code(KeyCode::Enter));
+            assert_eq!(a.new_project.as_ref().unwrap().field, 0, "{taken:?}");
+            assert!(a.flash.is_some(), "{taken:?} should say why");
+        }
+    }
+
+    #[test]
+    fn esc_steps_back_a_field_and_then_out() {
+        let mut a = app();
+        handle_key(&mut a, key('N'));
+        type_in(&mut a, "deskpro");
+        handle_key(&mut a, code(KeyCode::Enter));
+        handle_key(&mut a, code(KeyCode::Esc));
+        assert_eq!(a.new_project.as_ref().unwrap().field, 0);
+        assert_eq!(a.new_project.as_ref().unwrap().slug, "deskpro");
+        handle_key(&mut a, code(KeyCode::Esc));
+        assert!(a.new_project.is_none());
+        assert!(a.action.is_none());
+    }
+
+    #[test]
+    fn typing_is_typing_and_not_a_keybinding() {
+        let mut a = app();
+        handle_key(&mut a, key('N'));
+        assert!(!handle_key(&mut a, key('q')));
+        type_in(&mut a, "A");
+        assert_eq!(a.new_project.as_ref().unwrap().slug, "qA");
+        assert!(a.confirm.is_none() && a.action.is_none());
+    }
+
+    #[test]
+    fn shift_a_offers_to_archive_a_project_with_nothing_on_disk() {
+        let mut a = app();
+        a.projects = vec![project("react-19", vec![ws(None)])];
+        handle_key(&mut a, key('A'));
+        let c = a.confirm.as_ref().expect("a confirmation");
+        assert_eq!(c.verb, "archive\treact-19");
+        assert_eq!(c.yes, "archive");
+        assert!(c.body.iter().any(|l| l.contains("unfiled")));
+        assert!(handle_key(&mut a, key('y')));
+        assert_eq!(a.action.as_deref(), Some("archive\treact-19"));
+    }
+
+    #[test]
+    fn a_project_with_a_worktree_is_not_offered() {
+        let mut a = app();
+        a.projects = vec![project("react-19", vec![ws(Some("/tmp/react-19/hooks"))])];
+        handle_key(&mut a, key('A'));
+        assert!(a.confirm.is_none());
+        assert!(a.flash.is_some());
     }
 }
 

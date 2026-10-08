@@ -4,7 +4,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use crate::app::{ago, project_health, spinner, App, Pane, Sidebar};
+use crate::app::{ago, project_health, spinner, App, NewProject, Pane, Sidebar};
 use crate::discover::UNFILED;
 use crate::model::*;
 
@@ -201,6 +201,59 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let h = (text.len() as u16 + 2).min(f.area().height);
         let title = format!(" new workstream in {} ", n.project);
         draw_modal_left(f, &title, text, 74, h);
+    } else if let Some(n) = &app.new_project {
+        let mut text = vec![Line::from("")];
+        for (i, label) in NewProject::FIELDS.iter().enumerate() {
+            let on = i == n.field;
+            text.push(Line::from(vec![
+                Span::styled(
+                    format!("  {label:>9}  "),
+                    if on {
+                        Style::default().fg(ACCENT).bold()
+                    } else {
+                        Style::default().fg(DIM)
+                    },
+                ),
+                Span::styled(n.value(i).to_string(), Style::default().bold()),
+                if on {
+                    Span::styled("▏", Style::default().fg(ACCENT))
+                } else {
+                    Span::raw("")
+                },
+            ]));
+        }
+        text.push(Line::from(""));
+        text.push(Line::from(vec![
+            Span::styled("     readme  ", Style::default().fg(DIM)),
+            Span::styled(
+                format!(
+                    "~/projects/{}/README.md",
+                    if n.slug.is_empty() { "…" } else { &n.slug }
+                ),
+                Style::default().fg(DIM),
+            ),
+        ]));
+        text.push(Line::from(""));
+        let last = n.field + 1 == NewProject::FIELDS.len();
+        text.push(Line::from(vec![
+            Span::styled("  ↵", Style::default().fg(ACCENT)),
+            Span::styled(
+                if last { " create   " } else { " next   " },
+                Style::default().fg(DIM),
+            ),
+            Span::styled("esc", Style::default().fg(ACCENT)),
+            Span::styled(
+                if n.field > 0 {
+                    " back   "
+                } else {
+                    " cancel   "
+                },
+                Style::default().fg(DIM),
+            ),
+            Span::styled("emoji is optional", Style::default().fg(DIM)),
+        ]));
+        let h = (text.len() as u16 + 2).min(f.area().height);
+        draw_modal_left(f, " new project ", text, 60, h);
     } else if let Some(menu) = &app.copy_menu {
         // Fixed columns: number, label, value, then the note. The label is
         // truncated to its column rather than allowed to push the value right,
@@ -283,7 +336,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         text.push(Line::from(""));
         text.push(Line::from(vec![
             Span::styled("y", Style::default().fg(Color::Red).bold()),
-            Span::styled(" delete    ", Style::default().fg(DIM)),
+            Span::styled(format!(" {}    ", c.yes), Style::default().fg(DIM)),
             Span::styled("any other key", Style::default().bold()),
             Span::styled(" cancel", Style::default().fg(DIM)),
         ]));
@@ -1072,6 +1125,7 @@ fn draw_help(f: &mut Frame) {
         Line::from("  [ / ]           switch the sidebar between projects and reviews"),
         Line::from("  ↵               quit and cd to the selected workstream, creating it first"),
         Line::from("  n               new workstream: name it, pick what to branch from"),
+        Line::from("  N               new project: directory, name, emoji — then n for its first workstream"),
         Line::from("  /               filter projects by name, workstream or branch"),
         Line::from("  esc             step back: workstreams → projects, or clear a filter"),
         Line::from(""),
@@ -1084,6 +1138,7 @@ fn draw_help(f: &mut Frame) {
         Line::from("  b               rebase on main, then rebuild"),
         Line::from("  p / P           push / force-push with lease"),
         Line::from("  d               delete it, after confirming — a virtual row's branch, local and remote"),
+        Line::from("  A               archive the project to ~/projects/ARCHIVE, once it has no worktrees"),
         Line::from(""),
         Line::from(Span::styled("  in the review queue", Style::default().bold())),
         Line::from("  ↵               check the PR out under review/ and build it, or cd there"),

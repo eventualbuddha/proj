@@ -29,6 +29,9 @@ function proj --description "Manage project worktrees under ~/projects"
         case rm remove
             __proj_remove $argv
 
+        case archive
+            __proj_archive $argv
+
         case ls list
             __proj_list
 
@@ -82,6 +85,12 @@ function __proj_help
     echo "                                          override with --branch-name"
     echo "                                          Runs pnpm install and pnpm build"
     echo "                                          With --rebase, rebase on main before building"
+    echo "                                          A project that does not exist yet is created"
+    echo "                                          first, prompting for its README frontmatter"
+    echo "  new <project>                           Create just the project"
+    echo "  archive [<project>]                     Move a project to ~/projects/ARCHIVE (defaults"
+    echo "                                          to the one you are standing in)"
+    echo "                                          Refuses while it still has worktrees"
     echo "  rm|remove [<project>/<workstream>]      Remove a workstream (defaults to the current one)"
     echo "                                          Fails on uncommitted changes, or on commits that are"
     echo "                                          neither in main (by patch-id, so squash merges count)"
@@ -175,6 +184,17 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
                 end
                 __proj_new "$parts[2]" --branch-name "$parts[3]" $base
                 return $status
+
+            case new-project
+                # One line of output on success, and the dashboard reopens on
+                # the new project: the next thing to do there is `n`.
+                if __proj_create_project "$parts[2]" "$parts[3]" "$parts[4]"
+                    set pause 0
+                end
+
+            case archive
+                __proj_archive "$parts[2]"
+                set reopen
 
             case edit
                 # cd in, rather than passing the path as an argument. An editor
@@ -718,16 +738,25 @@ function __proj_new
     end
 
     set -l parts (string split -m1 / -- "$target")
-    if test (count $parts) -ne 2; or test -z "$parts[1]"; or test -z "$parts[2]"
-        echo "proj new: expected <project>/<workstream>, got '$target'" >&2
-        return 1
-    end
     set -l project $parts[1]
     set -l workstream $parts[2]
-
-    if not test -f "$root/$project/README.md"
-        echo "proj new: no project '$project' (expected $root/$project/README.md)" >&2
+    if test -z "$project"; or test (count $parts) -eq 2 -a -z "$workstream"
+        echo "proj new: expected <project>/<workstream> or <project>, got '$target'" >&2
         return 1
+    end
+
+    # A project that does not exist yet is made on the spot rather than refused:
+    # the first workstream is when a project becomes real, and sending you off to
+    # write a README by hand first is a detour the prompt can take instead.
+    if not test -f "$root/$project/README.md"
+        __proj_create_project "$project"
+        or return 1
+    else if test -z "$workstream"
+        echo "proj new: project '$project' already exists" >&2
+        return 1
+    end
+    if test -z "$workstream"
+        return 0
     end
 
     set -l wt_path "$root/$project/$workstream"
@@ -806,6 +835,140 @@ function __proj_new
 
     echo ""
     echo "Workstream '$project/$workstream' ready at $wt_path"
+end
+
+function __proj_create_project --description "Create PROJECT's directory and README, prompting for the frontmatter it was not given"
+    set -l root (__proj_root)
+    set -l project "$argv[1]"
+    set -l name "$argv[2]"
+    set -l emoji "$argv[3]"
+    set -l repos vxsuite
+    set -l project_status active
+
+    if test -z "$project"
+        echo "proj new: a project needs a directory name" >&2
+        return 1
+    end
+    if string match -q -r '/|\s' -- "$project"; or test "$project" = ARCHIVE
+        echo "proj new: '$project' cannot be a project directory" >&2
+        return 1
+    end
+    if test -e "$root/$project"
+        echo "proj new: $root/$project already exists" >&2
+        return 1
+    end
+
+    # Prompt for what was not passed, and only when there is someone to ask.
+    # The dashboard hands over all three fields; the command line hands over
+    # the directory and asks for the rest.
+    if test -z "$name"
+        if not isatty stdin
+            echo "proj new: no project '$project' (expected $root/$project/README.md)" >&2
+            return 1
+        end
+        echo "Creating project '$project' at $root/$project"
+        while test -z "$name"
+            read -P "  name: " name
+            or return 1
+        end
+        read -P "  emoji [📁]: " emoji
+        or return 1
+        read -P "  repos [$repos]: " -l answer
+        or return 1
+        test -n "$answer"; and set repos (string trim -c '[] ' -- "$answer")
+        read -P "  status [$project_status]: " answer
+        or return 1
+        test -n "$answer"; and set project_status "$answer"
+    end
+    test -n "$emoji"; or set emoji 📁
+
+    mkdir -p "$root/$project"
+    or return 1
+    printf '%s\n' \
+        '---' \
+        "emoji: \"$emoji\"" \
+        "name: $name" \
+        'kind: project' \
+        "repos: [$repos]" \
+        "status: $project_status" \
+        '---' \
+        '' \
+        "# $name" \
+        '' > "$root/$project/README.md"
+    or return 1
+
+    echo "Project '$project' created at $root/$project"
+end
+
+function __proj_archive --description "Move a project to ARCHIVE"
+    set -l root (__proj_root)
+    set -l project "$argv[1]"
+
+    if test (count $argv) -gt 1
+        echo "proj archive: unexpected argument '$argv[2]'" >&2
+        return 1
+    end
+
+    if test -z "$project"
+        # The project you are standing in, by the same containment rule as
+        # `proj rm` -- except a project directory itself counts too.
+        set -l here (realpath (pwd))
+        set -l rel (string replace -- (realpath "$root")/ "" "$here")
+        if test "$rel" != "$here"
+            set project (string split -m1 / -- "$rel")[1]
+        end
+        if test -z "$project"; or not test -f "$root/$project/README.md"
+            echo "proj archive: '"(pwd)"' is not inside a project" >&2
+            return 1
+        end
+    end
+
+    set -l from "$root/$project"
+    if not test -f "$from/README.md"
+        echo "proj archive: no project '$project'" >&2
+        return 1
+    end
+    if test "$project" = ARCHIVE
+        echo "proj archive: cannot archive the archive" >&2
+        return 1
+    end
+
+    # A worktree moved out of the root is one the dashboard cannot see but git
+    # still lists, and its branch would come back as a virtual row offering to
+    # create a worktree that already exists. Removing them first is the way.
+    set -l worktrees (__proj_workstreams "$project")
+    if test (count $worktrees) -gt 0
+        echo "proj archive: '$project' still has worktrees:" >&2
+        for entry in $worktrees
+            set -l parts (string split \t -- "$entry")
+            echo "  $parts[1]/$parts[2]" >&2
+        end
+        echo "" >&2
+        echo "Remove them first with: proj rm <project>/<workstream>" >&2
+        return 1
+    end
+
+    set -l to "$root/ARCHIVE/$project"
+    if test -e "$to"
+        echo "proj archive: $to already exists" >&2
+        return 1
+    end
+
+    # Step out before the floor goes.
+    set -l here (realpath (pwd))
+    if test "$here" = (realpath "$from"); or string match -q (realpath "$from")"/*" "$here"
+        __proj_goto "$root"
+        echo "Changed directory to $root"
+    end
+
+    mkdir -p "$root/ARCHIVE"
+    and mv "$from" "$to"
+    or begin
+        echo "proj archive: failed to move $from" >&2
+        return 1
+    end
+
+    echo "Archived '$project' to $to"
 end
 
 function __proj_stranded_commits --description "Commits on WORKTREE's HEAD that exist neither in main nor on its remote"

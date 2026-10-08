@@ -364,11 +364,44 @@ impl NewWorkstream {
     }
 }
 
+/// A project being invented: the directory name, then the frontmatter the
+/// README opens with. One field at a time, because the keys are the same
+/// letters as every command outside the modal.
+pub struct NewProject {
+    pub slug: String,
+    pub name: String,
+    pub emoji: String,
+    /// Which of the three is being typed into.
+    pub field: usize,
+}
+
+impl NewProject {
+    pub const FIELDS: [&'static str; 3] = ["directory", "name", "emoji"];
+
+    pub fn current(&mut self) -> &mut String {
+        match self.field {
+            0 => &mut self.slug,
+            1 => &mut self.name,
+            _ => &mut self.emoji,
+        }
+    }
+
+    pub fn value(&self, field: usize) -> &str {
+        match field {
+            0 => &self.slug,
+            1 => &self.name,
+            _ => &self.emoji,
+        }
+    }
+}
+
 pub struct Confirm {
     pub title: String,
     pub body: Vec<String>,
     /// The `--cd-file` verb to write if confirmed.
     pub verb: String,
+    /// What `y` does, for the prompt: "delete", "archive".
+    pub yes: &'static str,
 }
 
 /// Which list the sidebar is showing. lazygit cycles its panels with [ and ],
@@ -427,6 +460,8 @@ pub struct App {
     pub copy_menu: Option<CopyMenu>,
     /// A workstream being named, before it exists anywhere.
     pub new_ws: Option<NewWorkstream>,
+    /// A project being named, before its directory exists.
+    pub new_project: Option<NewProject>,
     pub filter: Option<String>,
     pub filtering: bool,
     pub tx: Sender<Msg>,
@@ -484,6 +519,7 @@ impl App {
             confirm: None,
             copy_menu: None,
             new_ws: None,
+            new_project: None,
             filter: None,
             filtering: false,
             tx,
@@ -1165,6 +1201,61 @@ impl App {
         if let Some(n) = &mut self.new_ws {
             n.name = name;
             n.picking_base = true;
+        }
+    }
+
+    /// Start naming a new project.
+    pub fn begin_new_project(&mut self) {
+        if self.sidebar == Sidebar::Reviews {
+            self.flash("switch to projects with [ to add a project");
+            return;
+        }
+        self.new_project = Some(NewProject {
+            slug: String::new(),
+            name: String::new(),
+            emoji: String::new(),
+            field: 0,
+        });
+    }
+
+    /// Accept the field being typed and move to the next, or say why not.
+    /// Returns true once every field has been accepted.
+    ///
+    /// The directory name is held to the same rule as a workstream's: it is
+    /// the first half of every branch name under it, so no slashes or spaces.
+    pub fn new_project_next(&mut self) -> bool {
+        let Some(n) = &mut self.new_project else {
+            return false;
+        };
+        let value = n.current().trim().to_string();
+        *n.current() = value.clone();
+        match n.field {
+            0 => {
+                if value.is_empty() {
+                    self.flash("a project needs a directory name");
+                    return false;
+                }
+                if value.contains('/') || value.contains(char::is_whitespace) {
+                    self.flash("no slashes or spaces in a project directory");
+                    return false;
+                }
+                if value == "ARCHIVE" || self.projects.iter().any(|p| p.slug == value) {
+                    self.flash(format!("{value} already exists"));
+                    return false;
+                }
+            }
+            1 if value.is_empty() => {
+                self.flash("a project needs a name");
+                return false;
+            }
+            _ => {}
+        }
+        let n = self.new_project.as_mut().unwrap();
+        if n.field + 1 < NewProject::FIELDS.len() {
+            n.field += 1;
+            false
+        } else {
+            true
         }
     }
 
