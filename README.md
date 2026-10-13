@@ -8,6 +8,10 @@ The layout is two levels — `~/projects/<project>/<workstream>` — where a pro
 is an initiative with a `README.md` and a workstream is one unit of review,
 usually one branch and one PR. A workstream directory *is* the worktree.
 
+Each project's README frontmatter names its `repos:`; a workstream is a worktree
+of the first one's canonical clone at `~/code/<repo>`, and the GitHub repo comes
+from that clone's `origin`.
+
 ## Parts
 
 | Path | What it is |
@@ -54,3 +58,4 @@ cargo run --bin proj-tui
 ```
 
 `PROJECTS_ROOT` overrides `~/projects` — the tests use it, and so can you.
+`PROJ_CODE_ROOT` overrides `~/code`.

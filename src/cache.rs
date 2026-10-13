@@ -24,6 +24,8 @@ pub struct P {
 #[derive(Serialize, Deserialize)]
 pub struct W {
     pub name: String,
+    #[serde(default)]
+    pub repo: String,
     pub path: Option<String>,
     pub branch: String,
     pub remote_branch: String,
@@ -64,6 +66,7 @@ pub fn save(projects: &[Project]) {
                     .iter()
                     .map(|w| W {
                         name: w.name.clone(),
+                        repo: w.repo.clone(),
                         path: w.path.as_ref().map(|p| p.display().to_string()),
                         branch: w.git.branch.clone(),
                         remote_branch: w.git.remote_branch.clone(),
@@ -108,6 +111,7 @@ pub fn load() -> Option<Vec<Project>> {
                 kind: ProjectKind::Project,
                 status: p.status,
                 readme: PathBuf::from(p.readme),
+                repos: Vec::new(),
                 branch_prefix: None,
                 branch_globs: Vec::new(),
                 workstreams: p
@@ -116,6 +120,7 @@ pub fn load() -> Option<Vec<Project>> {
                     .map(|w| Workstream {
                         project: p.slug.clone(),
                         name: w.name,
+                        repo: w.repo,
                         path: w.path.map(PathBuf::from),
                         git: GitState {
                             branch: w.branch,

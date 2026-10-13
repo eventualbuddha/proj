@@ -227,8 +227,8 @@ impl CheckState {
 
 /// One check context, with wherever it reports to.
 ///
-/// For this repo that is always CircleCI: every context is a StatusContext
-/// named `ci/circleci: <job>` whose targetUrl is that job's page. A "checks
+/// For vxsuite that is CircleCI: every context is a StatusContext named
+/// `ci/circleci: <job>` whose targetUrl is that job's page. A "checks
 /// url" built by appending /checks to the PR only ever gets you GitHub's own
 /// summary tab, which is a list of links to these.
 #[derive(Debug, Clone)]
@@ -307,6 +307,8 @@ pub struct PrInfo {
 pub struct Workstream {
     pub project: String,
     pub name: String,
+    /// The canonical clone this branch lives in, by directory name.
+    pub repo: String,
     /// `None` for a virtual row.
     pub path: Option<PathBuf>,
     pub git: GitState,
@@ -332,6 +334,8 @@ pub struct Project {
     pub kind: ProjectKind,
     pub status: String,
     pub readme: PathBuf,
+    /// From the frontmatter. The first is where new workstreams are made.
+    pub repos: Vec<String>,
     pub branch_prefix: Option<String>,
     /// Globs from the frontmatter, used to claim orphan branches.
     pub branch_globs: Vec<String>,
@@ -366,6 +370,7 @@ impl ReviewReason {
 
 #[derive(Debug, Clone)]
 pub struct Review {
+    pub repo: String,
     pub number: u32,
     pub title: String,
     pub url: String,

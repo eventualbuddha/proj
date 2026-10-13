@@ -8,6 +8,7 @@ mod github;
 mod ipc;
 mod link;
 mod model;
+mod repo;
 mod ui;
 
 use anyhow::{Context, Result};
@@ -741,23 +742,32 @@ fn run_github(app: &mut App, label: String, value: String) {
         return;
     };
 
+    if verb == "rerun" {
+        app.action = Some(format!("ci-rerun\t{rest}"));
+        return;
+    }
+    // Everything else is `<verb>:<repo>:<number>`.
+    let Some((repo, number)) = rest.split_once(':') else {
+        app.flash("unknown action");
+        return;
+    };
+    let Some(slug) = repo::github(repo).map(|gh| gh.slug()) else {
+        app.flash(format!("{repo} has no GitHub origin"));
+        return;
+    };
     match verb {
         "ready" => {
-            app.action = Some(format!("gh-ready\t{rest}"));
-        }
-        "rerun" => {
-            app.action = Some(format!("ci-rerun\t{rest}"));
+            app.action = Some(format!("gh-ready\t{number}\t{slug}"));
         }
         "review" | "ready-review" => {
-            let number: u32 = rest.parse().unwrap_or(0);
-            app.copy_menu = Some(CopyMenu::reviewer(format!("{verb}:{rest}")));
+            let (repo, number) = (repo.to_string(), number.parse::<u32>().unwrap_or(0));
+            app.copy_menu = Some(CopyMenu::reviewer(format!("{verb}:{number}:{slug}")));
             match &app.daemon {
-                Some(d) => d.send(ipc::Req::Reviewers { number }),
+                Some(d) => d.send(ipc::Req::Reviewers { repo, number }),
                 None => {
                     let tx = app.tx.clone();
                     std::thread::spawn(move || {
-                        let list = github::suggested_reviewers(app::OWNER, app::REPO, number)
-                            .unwrap_or_default();
+                        let list = github::suggested_reviewers(&repo, number).unwrap_or_default();
                         let _ = tx.send(app::Msg::Reviewers(list));
                     });
                 }
@@ -816,13 +826,18 @@ fn copy_selected(app: &mut App) {
         let pending = app.copy_menu.as_ref().and_then(|m| m.pending.clone());
         app.copy_menu = None;
         if let (Some(login), Some(pending)) = (login, pending) {
-            let (verb, number) = pending.split_once(':').unwrap_or(("review", ""));
+            let mut parts = pending.splitn(3, ':');
+            let (verb, number, slug) = (
+                parts.next().unwrap_or("review"),
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or(""),
+            );
             let v = if verb == "ready-review" {
                 "gh-ready-review"
             } else {
                 "gh-review"
             };
-            app.action = Some(format!("{v}\t{number}\t{login}"));
+            app.action = Some(format!("{v}\t{number}\t{login}\t{slug}"));
         }
         return;
     }
@@ -891,7 +906,7 @@ fn activate(app: &mut App) -> bool {
     };
     app.action = Some(match &w.path {
         Some(p) => format!("cd\t{}", p.display()),
-        None => format!("new\t{}\t{}", w.qualified(), w.git.branch),
+        None => format!("new\t{}\t{}\t\t{}", w.qualified(), w.git.branch, w.repo),
     });
     true
 }
@@ -910,7 +925,12 @@ fn activate_review(app: &mut App) -> bool {
     };
     let verb = match &r.worktree {
         Some(p) => format!("cd\t{}", p.display()),
-        None => format!("review-checkout\t{}\t{}", r.number, r.dir_name()),
+        None => format!(
+            "review-checkout\t{}\t{}\t{}",
+            r.number,
+            r.dir_name(),
+            r.repo
+        ),
     };
     emit(app, verb)
 }
@@ -928,7 +948,12 @@ fn checkout_review(app: &mut App) -> bool {
     };
     let verb = match &r.worktree {
         Some(p) => format!("review-update\t{}\t{}", p.display(), r.number),
-        None => format!("review-checkout\t{}\t{}", r.number, r.dir_name()),
+        None => format!(
+            "review-checkout\t{}\t{}\t{}",
+            r.number,
+            r.dir_name(),
+            r.repo
+        ),
     };
     emit(app, verb)
 }
@@ -938,25 +963,32 @@ fn checkout_review(app: &mut App) -> bool {
 /// existing branch to take the answer from.
 fn create_workstream(app: &mut App) -> bool {
     let Some(n) = &app.new_ws else { return false };
-    let (qualified, branch, base) = (
+    let (qualified, branch, base, repo) = (
         format!("{}/{}", n.project, n.name),
         n.branch(),
         n.base().to_string(),
+        n.repo.clone(),
     );
     app.new_ws = None;
-    emit(app, format!("new\t{qualified}\t{branch}\t{base}"))
+    emit(app, format!("new\t{qualified}\t{branch}\t{base}\t{repo}"))
 }
 
 /// Hand the shell a project to create: its directory, and the frontmatter its
-/// README opens with. `repos` and `status` take their defaults; the README is
-/// right there to edit for the rare project that needs otherwise.
+/// README opens with. `status` takes its default; the README is right there to
+/// edit for the rare project that needs otherwise.
 fn create_project(app: &mut App) -> bool {
     let Some(n) = app.new_project.take() else {
         return false;
     };
     emit(
         app,
-        format!("new-project\t{}\t{}\t{}", n.slug, n.name, n.emoji),
+        format!(
+            "new-project\t{}\t{}\t{}\t{}",
+            n.slug,
+            n.name,
+            n.emoji,
+            n.repo_list()
+        ),
     )
 }
 
@@ -1063,10 +1095,11 @@ fn confirm_delete(app: &mut App) {
 /// nowhere else is the entire safety net.
 fn confirm_delete_branch(app: &mut App) {
     let Some(w) = app.workstream() else { return };
-    let (qualified, branch, remote) = (
+    let (qualified, branch, remote, repo) = (
         w.qualified(),
         w.git.branch.clone(),
         w.git.remote_branch.clone(),
+        w.repo.clone(),
     );
 
     let mut body = vec![format!("branch  {branch}")];
@@ -1104,7 +1137,7 @@ fn confirm_delete_branch(app: &mut App) {
         // The remote name goes along whatever the tracking ref says: a prune
         // that has not run yet leaves `origin/<name>` there to delete, and the
         // remote side is checked before anything is pushed.
-        verb: format!("delete-branch\t{qualified}\t{branch}\t{remote}"),
+        verb: format!("delete-branch\t{qualified}\t{branch}\t{remote}\t{repo}"),
         yes: "delete",
     });
 }
@@ -1156,13 +1189,7 @@ fn dump(no_gh: bool) -> Result<()> {
     let mut app = App::new()?;
     app.scan_now()?;
     if !no_gh {
-        let branches: Vec<String> = app
-            .projects
-            .iter()
-            .flat_map(|p| p.workstreams.iter())
-            .map(|w| w.git.remote_branch.clone())
-            .collect();
-        match github::refresh(app::OWNER, app::REPO, &branches) {
+        match github::refresh(&app.branches(), &app.repos()) {
             Ok(cache) => {
                 github::apply(&mut app.projects, &cache);
                 app.fetched_at = Some(cache.fetched_at);
@@ -1305,6 +1332,7 @@ mod review_tests {
 
     fn review(number: u32, title: &str) -> Review {
         Review {
+            repo: "vxsuite".into(),
             number,
             title: title.into(),
             url: format!("https://github.com/votingworks/vxsuite/pull/{number}"),
@@ -1329,6 +1357,7 @@ mod review_tests {
             kind: ProjectKind::Review,
             status: "active".into(),
             readme: PathBuf::from("/tmp/projects/review/README.md"),
+            repos: vec!["vxsuite".into()],
             branch_prefix: None,
             branch_globs: Vec::new(),
             workstreams: dirs
@@ -1336,6 +1365,7 @@ mod review_tests {
                 .map(|d| Workstream {
                     project: "review".into(),
                     name: (*d).into(),
+                    repo: "vxsuite".into(),
                     path: Some(PathBuf::from(format!("/tmp/projects/review/{d}"))),
                     git: GitState::default(),
                     merged: Merged::No,
@@ -1357,7 +1387,7 @@ mod review_tests {
         );
         assert_eq!(
             a.action.as_deref(),
-            Some("review-checkout\t9083\t9083-fix-the-scanner-status")
+            Some("review-checkout\t9083\t9083-fix-the-scanner-status\tvxsuite")
         );
     }
 
@@ -1414,7 +1444,7 @@ mod review_tests {
         assert!(handle_key(&mut a, key('c')));
         assert_eq!(
             a.action.as_deref(),
-            Some("review-checkout\t9083\t9083-fix-it")
+            Some("review-checkout\t9083\t9083-fix-it\tvxsuite")
         );
     }
 
@@ -1493,6 +1523,7 @@ mod new_project_tests {
             kind: ProjectKind::Project,
             status: "active".into(),
             readme: std::path::PathBuf::from(format!("/tmp/{slug}/README.md")),
+            repos: vec!["vxsuite".into()],
             branch_prefix: None,
             branch_globs: Vec::new(),
             workstreams,
@@ -1503,6 +1534,7 @@ mod new_project_tests {
         Workstream {
             project: "react-19".into(),
             name: "hooks".into(),
+            repo: "vxsuite".into(),
             path: path.map(std::path::PathBuf::from),
             git: GitState::default(),
             merged: Merged::No,
@@ -1526,10 +1558,12 @@ mod new_project_tests {
         type_in(&mut a, "DeskPro scanner");
         handle_key(&mut a, code(KeyCode::Tab));
         type_in(&mut a, "📄");
+        handle_key(&mut a, code(KeyCode::Enter));
+        type_in(&mut a, " arlo");
         assert!(handle_key(&mut a, code(KeyCode::Enter)), "creating quits");
         assert_eq!(
             a.action.as_deref(),
-            Some("new-project\tdeskpro\tDeskPro scanner\t📄")
+            Some("new-project\tdeskpro\tDeskPro scanner\t📄\tvxsuite, arlo")
         );
     }
 
@@ -1553,8 +1587,16 @@ mod new_project_tests {
         );
         type_in(&mut a, "DeskPro");
         handle_key(&mut a, code(KeyCode::Enter));
+        handle_key(&mut a, code(KeyCode::Enter));
+        a.new_project.as_mut().unwrap().repos.clear();
+        handle_key(&mut a, code(KeyCode::Enter));
+        assert_eq!(a.new_project.as_ref().unwrap().field, 3, "no repos refused");
+        type_in(&mut a, "arlo");
         assert!(handle_key(&mut a, code(KeyCode::Enter)));
-        assert_eq!(a.action.as_deref(), Some("new-project\tdeskpro\tDeskPro\t"));
+        assert_eq!(
+            a.action.as_deref(),
+            Some("new-project\tdeskpro\tDeskPro\t\tarlo")
+        );
     }
 
     #[test]
@@ -1646,6 +1688,7 @@ mod new_workstream_tests {
             kind: ProjectKind::Project,
             status: "active".into(),
             readme: std::path::PathBuf::from("/tmp/react-19/README.md"),
+            repos: vec!["vxsuite".into()],
             branch_prefix: None,
             branch_globs: Vec::new(),
             workstreams: vec![ws("react-query"), ws("esm-lib")],
@@ -1657,6 +1700,7 @@ mod new_workstream_tests {
         Workstream {
             project: "react-19".into(),
             name: name.into(),
+            repo: "vxsuite".into(),
             path: Some(std::path::PathBuf::from(format!("/tmp/react-19/{name}"))),
             git: GitState {
                 branch: format!("react-19/{name}"),
@@ -1690,7 +1734,7 @@ mod new_workstream_tests {
         assert!(handle_key(&mut a, code(KeyCode::Enter)), "creating quits");
         assert_eq!(
             a.action.as_deref(),
-            Some("new\treact-19/hooks\treact-19/hooks\treact-19/react-query")
+            Some("new\treact-19/hooks\treact-19/hooks\treact-19/react-query\tvxsuite")
         );
     }
 
@@ -1770,11 +1814,13 @@ mod delete_tests {
             kind: ProjectKind::Project,
             status: "active".into(),
             readme: std::path::PathBuf::from("/tmp/backup-restore/README.md"),
+            repos: vec!["vxsuite".into()],
             branch_prefix: None,
             branch_globs: Vec::new(),
             workstreams: vec![Workstream {
                 project: "backup-restore".into(),
                 name: "bump-test-timeout".into(),
+                repo: "vxsuite".into(),
                 path: Some(std::path::PathBuf::from("/tmp/w")),
                 git,
                 merged,
@@ -1843,7 +1889,7 @@ mod delete_tests {
         let c = a.confirm.as_ref().expect("a confirmation");
         assert_eq!(
             c.verb,
-            "delete-branch\tbackup-restore/bump-test-timeout\tbackup-restore/esm-batch-4\tbrian/esm-batch-4"
+            "delete-branch\tbackup-restore/bump-test-timeout\tbackup-restore/esm-batch-4\tbrian/esm-batch-4\tvxsuite"
         );
         let body = c.body.join("\n");
         assert!(
@@ -2151,6 +2197,7 @@ mod github_menu_tests {
         Workstream {
             project: "p".into(),
             name: "w".into(),
+            repo: "vxsuite".into(),
             path: Some(std::path::PathBuf::from("/tmp/w")),
             git: GitState {
                 branch: "p/w".into(),

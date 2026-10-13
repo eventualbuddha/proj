@@ -42,8 +42,9 @@ complete -c proj -n '__proj_using_command_any daemon' -a stop -d "Ask it to exit
 # new — the argument is a project the workstream will be created under, so
 # complete projects with a trailing slash rather than existing workstreams.
 complete -c proj -n '__proj_using_command_any new add' -a '(proj __projects)'
-complete -c proj -n '__proj_using_command_any new add' -l branch -s b -d "Base branch for a new branch (default: main)" -x -a '(proj __branches)'
-complete -c proj -n '__proj_using_command_any new add' -l branch-name -s n -d "Branch name (default: from the project's branch-prefix)" -x -a '(proj __branches)'
+complete -c proj -n '__proj_using_command_any new add' -l branch -s b -d "Base branch for a new branch (default: main)" -x -a '(proj __branches (commandline -opc))'
+complete -c proj -n '__proj_using_command_any new add' -l branch-name -s n -d "Branch name (default: from the project's branch-prefix)" -x -a '(proj __branches (commandline -opc))'
+complete -c proj -n '__proj_using_command_any new add' -l repo -d "Repo to add the worktree from (default: the project's first)" -x
 complete -c proj -n '__proj_using_command_any new add' -l rebase -d "Rebase on main before building"
 
 # archive — projects only

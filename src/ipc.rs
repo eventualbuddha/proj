@@ -15,24 +15,28 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-use crate::github::Cache;
+use crate::github::{Cache, RepoBranch};
 use crate::model::Check;
 
 /// Instance to daemon.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Req {
-    /// The branches this instance wants PR state for. Sent whenever the scan
-    /// changes them; the daemon queries the union over every instance.
+    /// The branches this instance wants PR state for, and the repos whose
+    /// review queues it shows. Sent whenever the scan changes them; the daemon
+    /// queries the union over every instance.
     Branches {
-        branches: Vec<String>,
+        branches: Vec<RepoBranch>,
+        repos: Vec<String>,
     },
     /// Fetch now, whatever the timer thinks.
     Refresh,
     Contexts {
+        repo: String,
         number: u32,
     },
     Reviewers {
+        repo: String,
         number: u32,
     },
     Status,
@@ -55,6 +59,7 @@ pub enum Res {
         message: String,
     },
     Contexts {
+        repo: String,
         number: u32,
         checks: Vec<WireCheck>,
     },

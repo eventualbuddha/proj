@@ -15,12 +15,10 @@ use ratatui::widgets::{ListState, TableState};
 use crate::client;
 use crate::discover;
 use crate::git;
-use crate::github;
+use crate::github::{self, RepoBranch};
 use crate::ipc::Req;
 use crate::model::*;
-
-pub const OWNER: &str = "votingworks";
-pub const REPO: &str = "vxsuite";
+use crate::repo;
 
 /// How often to re-read the filesystem and git. lazygit refreshes local state
 /// every 10s; this scan is heavier than the one lazygit does on that cadence
@@ -40,11 +38,11 @@ pub enum Msg {
     Scanned(Vec<Project>),
     Refreshed(Box<github::Cache>),
     RefreshFailed(String),
-    /// Merged-ness, keyed by branch. Deliberately *not* a whole tree: sending
-    /// one back would clobber anything fetched lazily since the copy was taken,
-    /// and would re-enter the scan handler.
-    Merged(Vec<(String, Merged)>),
-    Contexts(u32, Vec<Check>),
+    /// Merged-ness, keyed by repo and branch. Deliberately *not* a whole tree:
+    /// sending one back would clobber anything fetched lazily since the copy
+    /// was taken, and would re-enter the scan handler.
+    Merged(Vec<(RepoBranch, Merged)>),
+    Contexts(String, u32, Vec<Check>),
     Reviewers(Vec<String>),
     /// The daemon connection came up. Until this lands -- and after
     /// `DaemonLost` -- every fetch below runs in this process instead.
@@ -231,9 +229,12 @@ impl CopyMenu {
         }
         // The `gh` one-liner stays even with a worktree on disk: it is what you
         // paste into someone else's terminal, or your own outside ~/projects.
+        let repo_flag = repo::github(&r.repo)
+            .map(|gh| format!(" --repo {}", gh.slug()))
+            .unwrap_or_default();
         items.push(CopyItem::new(
             "checkout",
-            format!("gh pr checkout {}", r.number),
+            format!("gh pr checkout {}{repo_flag}", r.number),
         ));
         CopyMenu::copy(items)
     }
@@ -242,47 +243,46 @@ impl CopyMenu {
     pub fn github_for(w: &Workstream) -> Vec<CopyItem> {
         let mut items = Vec::new();
         let remote = &w.git.remote_branch;
-        match &w.pr {
-            Some(pr) => items.push(CopyItem::new("PR url", pr.url.clone())),
-            None => items.push(
+        let gh = repo::github(&w.repo);
+        match (&w.pr, &gh) {
+            (Some(pr), _) => items.push(CopyItem::new("PR url", pr.url.clone())),
+            (None, Some(gh)) => items.push(
                 CopyItem::new(
                     "open a PR",
                     format!(
-                        "https://github.com/votingworks/vxsuite/compare/main...{remote}?expand=1"
+                        "https://github.com/{}/compare/main...{remote}?expand=1",
+                        gh.slug()
                     ),
                 )
                 .with_note("copies the compare url"),
             ),
+            (None, None) => {}
         }
         if let Some(pr) = &w.pr {
-            let n = pr.number;
+            let (n, r) = (pr.number, &w.repo);
             if pr.state == PrState::Draft {
                 items.push(
                     CopyItem::new("mark ready", format!("gh pr ready {n}"))
-                        .with_action(format!("ready:{n}")),
+                        .with_action(format!("ready:{r}:{n}")),
                 );
                 items.push(
                     CopyItem::new(
                         "mark ready, request review",
                         format!("gh pr ready {n} && gh pr edit {n} --add-reviewer …"),
                     )
-                    .with_action(format!("ready-review:{n}"))
+                    .with_action(format!("ready-review:{r}:{n}"))
                     .with_note("asks who"),
                 );
             } else {
                 items.push(
                     CopyItem::new("request review", format!("gh pr edit {n} --add-reviewer …"))
-                        .with_action(format!("review:{n}"))
+                        .with_action(format!("review:{r}:{n}"))
                         .with_note("asks who"),
                 );
             }
             if pr.checks.state == CheckState::Failure {
-                if let Some(c) = pr.checks.ci_url() {
-                    items.push(
-                        CopyItem::new("re-run failed jobs", "CircleCI, this workflow".to_string())
-                            .with_action(format!("rerun:{}", c.url))
-                            .with_note(short_job(&c.name)),
-                    );
+                if let Some(item) = rerun_item(&pr.checks) {
+                    items.push(item);
                 }
             }
         }
@@ -296,12 +296,8 @@ impl CopyMenu {
     pub fn github_for_review(r: &Review) -> Vec<CopyItem> {
         let mut items = vec![CopyItem::new("PR url", r.url.clone())];
         if r.checks.state == CheckState::Failure {
-            if let Some(c) = r.checks.ci_url() {
-                items.push(
-                    CopyItem::new("re-run failed jobs", "CircleCI, this workflow".to_string())
-                        .with_action(format!("rerun:{}", c.url))
-                        .with_note(short_job(&c.name)),
-                );
+            if let Some(item) = rerun_item(&r.checks) {
+                items.push(item);
             }
         }
         items
@@ -310,6 +306,19 @@ impl CopyMenu {
     pub fn selected(&self) -> Option<&CopyItem> {
         self.items.get(self.idx)
     }
+}
+
+/// Re-running is CircleCI's API, so only a CircleCI job gets the entry.
+fn rerun_item(checks: &Checks) -> Option<CopyItem> {
+    let c = checks.ci_url()?;
+    if !c.url.contains("circleci.com/") {
+        return None;
+    }
+    Some(
+        CopyItem::new("re-run failed jobs", "CircleCI, this workflow".to_string())
+            .with_action(format!("rerun:{}", c.url))
+            .with_note(short_job(&c.name)),
+    )
 }
 
 /// A base to branch from: `main`, or another workstream in the project.
@@ -323,6 +332,7 @@ pub struct Base {
 /// typing and picking want the same keys.
 pub struct NewWorkstream {
     pub project: String,
+    pub repo: String,
     pub name: String,
     pub bases: Vec<Base>,
     pub base_idx: usize,
@@ -331,19 +341,25 @@ pub struct NewWorkstream {
 }
 
 impl NewWorkstream {
-    fn for_project(p: &Project) -> Self {
+    fn for_project(p: &Project, repo: String) -> Self {
         // `main` first: branching from it is the default and the common case,
         // and stacking on another workstream is the deliberate one.
         let mut bases = vec![Base {
             label: "main".into(),
             branch: "main".into(),
         }];
-        bases.extend(p.workstreams.iter().map(|w| Base {
-            label: w.name.clone(),
-            branch: w.git.branch.clone(),
-        }));
+        bases.extend(
+            p.workstreams
+                .iter()
+                .filter(|w| w.repo == repo)
+                .map(|w| Base {
+                    label: w.name.clone(),
+                    branch: w.git.branch.clone(),
+                }),
+        );
         NewWorkstream {
             project: p.slug.clone(),
+            repo,
             name: String::new(),
             bases,
             base_idx: 0,
@@ -371,18 +387,21 @@ pub struct NewProject {
     pub slug: String,
     pub name: String,
     pub emoji: String,
-    /// Which of the three is being typed into.
+    /// Comma-separated clone names under `~/code`.
+    pub repos: String,
+    /// Which field is being typed into.
     pub field: usize,
 }
 
 impl NewProject {
-    pub const FIELDS: [&'static str; 3] = ["directory", "name", "emoji"];
+    pub const FIELDS: [&'static str; 4] = ["directory", "name", "emoji", "repos"];
 
     pub fn current(&mut self) -> &mut String {
         match self.field {
             0 => &mut self.slug,
             1 => &mut self.name,
-            _ => &mut self.emoji,
+            2 => &mut self.emoji,
+            _ => &mut self.repos,
         }
     }
 
@@ -390,8 +409,18 @@ impl NewProject {
         match field {
             0 => &self.slug,
             1 => &self.name,
-            _ => &self.emoji,
+            2 => &self.emoji,
+            _ => &self.repos,
         }
+    }
+
+    /// The repos as the frontmatter list's contents: `a, b`.
+    pub fn repo_list(&self) -> String {
+        self.repos
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|r| !r.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -445,8 +474,8 @@ pub struct App {
     /// Row of the detail pane holding the PR url, so a click can find it. Set
     /// during render, because the pane's layout depends on what the row has.
     pub url_row: Option<u16>,
-    /// PR numbers whose failing-check names are being fetched right now.
-    pub contexts_inflight: HashSet<u32>,
+    /// PRs, by repo and number, whose check contexts are being fetched now.
+    pub contexts_inflight: HashSet<(String, u32)>,
     /// Where to land once the first scan arrives. The scan runs on a thread, so
     /// at startup there is nothing to select *in* yet -- the request has to be
     /// held until there is.
@@ -470,9 +499,9 @@ pub struct App {
     /// call happens on this instance's own threads -- correct, just repeated
     /// once per open window.
     pub daemon: Option<client::Handle>,
-    /// The branch list the daemon was last told about, so the scan only speaks
-    /// up when it has something new to say.
-    pub sent_branches: Vec<String>,
+    /// The branches and repos the daemon was last told about, so the scan only
+    /// speaks up when it has something new to say.
+    pub sent_branches: (Vec<RepoBranch>, Vec<String>),
     /// An instruction for the fish wrapper, written to --cd-file on exit.
     ///
     /// A verb rather than a bare path because a virtual row has nowhere to cd
@@ -525,13 +554,13 @@ impl App {
             tx,
             rx,
             daemon: None,
-            sent_branches: Vec::new(),
+            sent_branches: Default::default(),
             action: None,
         };
         // Draw last run's state immediately; the scan replaces it when it lands.
         if let Some(projects) = crate::cache::load() {
             app.projects = projects;
-            if let Some(c) = github::load_cache(OWNER, REPO) {
+            if let Some(c) = github::load_cache() {
                 app.fetched_at = Some(c.fetched_at);
                 github::apply(&mut app.projects, &c);
                 app.reviews = github::to_reviews(&c);
@@ -579,7 +608,7 @@ impl App {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let mut projects = discover::scan().unwrap_or_default();
-            if let Some(cache) = github::load_cache(OWNER, REPO) {
+            if let Some(cache) = github::load_cache() {
                 github::apply(&mut projects, &cache);
             }
             // Merged-ness is not computed here: it is the slow half, the
@@ -595,7 +624,7 @@ impl App {
     /// loop to deliver a message to.
     pub fn scan_now(&mut self) -> Result<()> {
         self.projects = discover::scan()?;
-        if let Some(cache) = github::load_cache(OWNER, REPO) {
+        if let Some(cache) = github::load_cache() {
             self.fetched_at = Some(cache.fetched_at);
             github::apply(&mut self.projects, &cache);
         }
@@ -611,18 +640,7 @@ impl App {
     /// milliseconds over every row, so this answers with pairs rather than a
     /// tree -- see `Msg::Merged`.
     pub fn start_merged_pass(&mut self) {
-        let rows: Vec<(String, Option<PathBuf>, bool)> = self
-            .projects
-            .iter()
-            .flat_map(|p| p.workstreams.iter())
-            .map(|w| {
-                (
-                    w.git.branch.clone(),
-                    w.path.clone(),
-                    w.pr.as_ref().is_some_and(|pr| pr.state == PrState::Merged),
-                )
-            })
-            .collect();
+        let rows = merged_rows(&self.projects);
         let tx = self.tx.clone();
         self.merging = true;
         std::thread::spawn(move || {
@@ -632,12 +650,33 @@ impl App {
 
     /// The branches this instance wants PR state for. Remote names, because
     /// that is the only name GitHub knows them by.
-    pub fn branches(&self) -> Vec<String> {
+    pub fn branches(&self) -> Vec<RepoBranch> {
         self.projects
             .iter()
             .flat_map(|p| p.workstreams.iter())
-            .map(|w| w.git.remote_branch.clone())
+            .filter(|w| !w.repo.is_empty() && !w.git.remote_branch.is_empty())
+            .map(|w| RepoBranch {
+                repo: w.repo.clone(),
+                branch: w.git.remote_branch.clone(),
+            })
             .collect()
+    }
+
+    /// Every repo a project names or a row is in: the review queue covers them
+    /// all, and each gets fetched.
+    pub fn repos(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let named = self.projects.iter().flat_map(|p| p.repos.iter());
+        let rows = self
+            .projects
+            .iter()
+            .flat_map(|p| p.workstreams.iter().map(|w| &w.repo));
+        for r in named.chain(rows) {
+            if !r.is_empty() && !out.contains(r) {
+                out.push(r.clone());
+            }
+        }
+        out
     }
 
     /// Tell the daemon what this window is looking at, if that has changed.
@@ -646,14 +685,15 @@ impl App {
     /// be announced before it can come back with a PR on it.
     pub fn publish_branches(&mut self) {
         let Some(d) = &self.daemon else { return };
-        let branches = self.branches();
-        if branches == self.sent_branches {
+        let sent = (self.branches(), self.repos());
+        if sent == self.sent_branches {
             return;
         }
         d.send(Req::Branches {
-            branches: branches.clone(),
+            branches: sent.0.clone(),
+            repos: sent.1.clone(),
         });
-        self.sent_branches = branches;
+        self.sent_branches = sent;
     }
 
     pub fn start_refresh(&mut self) {
@@ -670,11 +710,10 @@ impl App {
             }
             return;
         }
-        let branches = self.branches();
+        let (branches, repos) = (self.branches(), self.repos());
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let repo = discover::repo_path();
-            let msg = match github::fetch_and_refresh(&repo, OWNER, REPO, &branches) {
+            let msg = match github::fetch_and_refresh(&branches, &repos) {
                 Ok(cache) => Msg::Refreshed(Box::new(cache)),
                 Err(e) => Msg::RefreshFailed(format!("{e:#}")),
             };
@@ -694,11 +733,11 @@ impl App {
             if r.checks.contexts.is_some() || r.checks.is_empty() {
                 return;
             }
-            let number = r.number;
-            if !self.contexts_inflight.insert(number) {
+            let key = (r.repo.clone(), r.number);
+            if !self.contexts_inflight.insert(key.clone()) {
                 return;
             }
-            self.fetch_contexts(number);
+            self.fetch_contexts(key);
             return;
         }
 
@@ -709,27 +748,27 @@ impl App {
         if pr.checks.contexts.is_some() || pr.checks.is_empty() {
             return;
         }
-        let number = pr.number;
-        if !self.contexts_inflight.insert(number) {
+        let key = (w.repo.clone(), pr.number);
+        if !self.contexts_inflight.insert(key.clone()) {
             return;
         }
-        self.fetch_contexts(number);
+        self.fetch_contexts(key);
     }
 
     /// Through the daemon when there is one -- several windows watching the same
     /// PR then cost one query between them -- and on a thread here when there is
     /// not.
-    fn fetch_contexts(&self, number: u32) {
+    fn fetch_contexts(&self, (repo, number): (String, u32)) {
         if let Some(d) = &self.daemon {
-            d.send(Req::Contexts { number });
+            d.send(Req::Contexts { repo, number });
             return;
         }
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             // An empty list on failure, so the row settles into "no names" rather
             // than spinning forever.
-            let list = github::contexts(OWNER, REPO, number).unwrap_or_default();
-            let _ = tx.send(Msg::Contexts(number, list));
+            let list = github::contexts(&repo, number).unwrap_or_default();
+            let _ = tx.send(Msg::Contexts(repo, number, list));
         });
     }
 
@@ -804,10 +843,10 @@ impl App {
                 }
                 Msg::Merged(pairs) => {
                     self.merging = false;
-                    for (branch, m) in pairs {
+                    for (rb, m) in pairs {
                         for p in &mut self.projects {
                             for w in &mut p.workstreams {
-                                if w.git.branch == branch {
+                                if w.repo == rb.repo && w.git.branch == rb.branch {
                                     w.merged = m;
                                 }
                             }
@@ -836,12 +875,12 @@ impl App {
                     // Everything this instance knows about, at once: the daemon
                     // answers a connection with its cache, and answers a branch
                     // list it has not seen by fetching.
-                    self.sent_branches.clear();
+                    self.sent_branches = Default::default();
                     self.publish_branches();
                 }
                 Msg::DaemonLost => {
                     self.daemon = None;
-                    self.sent_branches.clear();
+                    self.sent_branches = Default::default();
                     self.refreshing = false;
                     // Requests that went to the daemon will never be answered
                     // now, and the rows they belong to are still saying
@@ -855,19 +894,20 @@ impl App {
                         self.network_at = github::now();
                     }
                 }
-                Msg::Contexts(number, list) => {
-                    self.contexts_inflight.remove(&number);
-                    // A number can name a workstream's PR or a review; both
-                    // lists are keyed by it, so both get the answer.
+                Msg::Contexts(repo, number, list) => {
+                    self.contexts_inflight.remove(&(repo.clone(), number));
+                    // A PR can be a workstream's or a review; both lists are
+                    // keyed by it, so both get the answer.
                     for r in &mut self.reviews {
-                        if r.number == number {
+                        if r.repo == repo && r.number == number {
                             r.checks.contexts = Some(list.clone());
                         }
                     }
                     for p in &mut self.projects {
                         for w in &mut p.workstreams {
+                            let here = w.repo == repo;
                             if let Some(pr) = &mut w.pr {
-                                if pr.number == number {
+                                if here && pr.number == number {
                                     pr.checks.contexts = Some(list.clone());
                                 }
                             }
@@ -935,18 +975,22 @@ impl App {
     /// from the filesystem, and nothing but the PR number in the directory name
     /// connects them -- which is why the number leads that name.
     pub fn link_reviews(&mut self) {
-        let dirs: Vec<(String, PathBuf)> = self
+        let dirs: Vec<(&str, String, PathBuf)> = self
             .projects
             .iter()
             .filter(|p| p.kind == ProjectKind::Review)
             .flat_map(|p| p.workstreams.iter())
-            .filter_map(|w| w.path.clone().map(|path| (w.name.clone(), path)))
+            .filter_map(|w| {
+                w.path
+                    .clone()
+                    .map(|path| (w.repo.as_str(), w.name.clone(), path))
+            })
             .collect();
         for r in &mut self.reviews {
             r.worktree = dirs
                 .iter()
-                .find(|(name, _)| r.owns_dir(name))
-                .map(|(_, path)| path.clone());
+                .find(|(repo, name, _)| *repo == r.repo && r.owns_dir(name))
+                .map(|(_, _, path)| path.clone());
         }
     }
 
@@ -1010,31 +1054,47 @@ impl App {
     }
 }
 
-/// Merged-ness for a set of (branch, worktree, pr-says-merged) rows.
-pub fn merged_for(rows: &[(String, Option<PathBuf>, bool)]) -> Vec<(String, Merged)> {
-    let repo = discover::repo_path();
-    let base = git::base_ref(&repo);
-    git::par_map(rows.iter().collect(), |(branch, path, pr_merged)| {
-        let dir = path.clone().unwrap_or_else(|| repo.clone());
-        (branch.clone(), git::merged(&dir, branch, &base, *pr_merged))
+/// A row as the merged-ness pass needs it: which branch, where, and whether
+/// its PR says merged.
+pub type MergedRow = (RepoBranch, Option<PathBuf>, bool);
+
+fn merged_rows(projects: &[Project]) -> Vec<MergedRow> {
+    projects
+        .iter()
+        .flat_map(|p| p.workstreams.iter())
+        .map(|w| {
+            (
+                RepoBranch {
+                    repo: w.repo.clone(),
+                    branch: w.git.branch.clone(),
+                },
+                w.path.clone(),
+                w.pr.as_ref().is_some_and(|pr| pr.state == PrState::Merged),
+            )
+        })
+        .collect()
+}
+
+/// Merged-ness for a set of rows, each against its own repo's base.
+pub fn merged_for(rows: &[MergedRow]) -> Vec<(RepoBranch, Merged)> {
+    let mut repos: Vec<&str> = rows.iter().map(|(rb, _, _)| rb.repo.as_str()).collect();
+    repos.sort();
+    repos.dedup();
+    let bases: std::collections::HashMap<&str, String> =
+        git::par_map(repos, |r| (r, git::base_ref(&repo::path(r))))
+            .into_iter()
+            .collect();
+    git::par_map(rows.iter().collect(), |(rb, path, pr_merged)| {
+        let dir = path.clone().unwrap_or_else(|| repo::path(&rb.repo));
+        let base = &bases[rb.repo.as_str()];
+        (rb.clone(), git::merged(&dir, &rb.branch, base, *pr_merged))
     })
 }
 
 /// Merged-ness for every row. Depends on the PR answer, so it must run *after*
 /// GitHub state is applied -- before it, every squash-merged branch reports open.
 pub fn compute_merged(projects: &mut [Project]) {
-    let rows: Vec<(String, Option<PathBuf>, bool)> = projects
-        .iter()
-        .flat_map(|p| p.workstreams.iter())
-        .map(|w| {
-            (
-                w.git.branch.clone(),
-                w.path.clone(),
-                w.pr.as_ref().is_some_and(|pr| pr.state == PrState::Merged),
-            )
-        })
-        .collect();
-    let answers = merged_for(&rows);
+    let answers = merged_for(&merged_rows(projects));
     for (w, (_, m)) in projects
         .iter_mut()
         .flat_map(|p| p.workstreams.iter_mut())
@@ -1123,39 +1183,51 @@ impl App {
         }
     }
 
-    fn failing_by_pr(&self) -> Vec<(u32, Vec<Check>)> {
+    fn failing_by_pr(&self) -> Vec<((String, u32), Vec<Check>)> {
         self.projects
             .iter()
             .flat_map(|p| p.workstreams.iter())
-            .filter_map(|w| w.pr.as_ref())
-            .filter_map(|pr| pr.checks.contexts.clone().map(|f| (pr.number, f)))
+            .filter_map(|w| w.pr.as_ref().map(|pr| (&w.repo, pr)))
+            .filter_map(|(r, pr)| {
+                pr.checks
+                    .contexts
+                    .clone()
+                    .map(|f| ((r.clone(), pr.number), f))
+            })
             .collect()
     }
 
-    fn merged_by_branch(&self) -> Vec<(String, Merged)> {
+    fn merged_by_branch(&self) -> Vec<((String, String), Merged)> {
         self.projects
             .iter()
             .flat_map(|p| p.workstreams.iter())
             .filter(|w| w.merged.is_merged())
-            .map(|w| (w.git.branch.clone(), w.merged))
+            .map(|w| ((w.repo.clone(), w.git.branch.clone()), w.merged))
             .collect()
     }
 
-    fn restore_merged(&mut self, merged: &[(String, Merged)]) {
+    fn restore_merged(&mut self, merged: &[((String, String), Merged)]) {
         for p in &mut self.projects {
             for w in &mut p.workstreams {
-                if let Some((_, m)) = merged.iter().find(|(b, _)| *b == w.git.branch) {
+                if let Some((_, m)) = merged
+                    .iter()
+                    .find(|((r, b), _)| *r == w.repo && *b == w.git.branch)
+                {
                     w.merged = *m;
                 }
             }
         }
     }
 
-    fn restore_failing(&mut self, failing: &[(u32, Vec<Check>)]) {
+    fn restore_failing(&mut self, failing: &[((String, u32), Vec<Check>)]) {
         for p in &mut self.projects {
             for w in &mut p.workstreams {
+                let repo = &w.repo;
                 if let Some(pr) = &mut w.pr {
-                    if let Some((_, f)) = failing.iter().find(|(n, _)| *n == pr.number) {
+                    if let Some((_, f)) = failing
+                        .iter()
+                        .find(|((r, n), _)| r == repo && *n == pr.number)
+                    {
                         pr.checks.contexts = Some(f.clone());
                     }
                 }
@@ -1169,9 +1241,19 @@ impl App {
             self.flash("switch to projects with [ to add a workstream");
             return;
         }
-        match self.project() {
-            Some(p) => self.new_ws = Some(NewWorkstream::for_project(p)),
-            None => self.flash("no project selected"),
+        let Some(p) = self.project() else {
+            self.flash("no project selected");
+            return;
+        };
+        match p.repos.first() {
+            Some(r) => self.new_ws = Some(NewWorkstream::for_project(p, r.clone())),
+            None => {
+                let msg = format!(
+                    "{} names no repos: add `repos: [...]` to its README",
+                    p.slug
+                );
+                self.flash(msg)
+            }
         }
     }
 
@@ -1210,10 +1292,17 @@ impl App {
             self.flash("switch to projects with [ to add a project");
             return;
         }
+        // Prefilled from the selected project: a new project is usually in
+        // the same repo as the one you were just looking at.
+        let repos = self
+            .project()
+            .map(|p| p.repos.join(", "))
+            .unwrap_or_default();
         self.new_project = Some(NewProject {
             slug: String::new(),
             name: String::new(),
             emoji: String::new(),
+            repos,
             field: 0,
         });
     }
@@ -1246,6 +1335,10 @@ impl App {
             }
             1 if value.is_empty() => {
                 self.flash("a project needs a name");
+                return false;
+            }
+            3 if value.is_empty() => {
+                self.flash("a project needs at least one repo");
                 return false;
             }
             _ => {}
@@ -1311,11 +1404,13 @@ mod tests {
             kind: ProjectKind::Project,
             status: "active".into(),
             readme: PathBuf::from("/tmp/backup-restore/README.md"),
+            repos: vec!["vxsuite".into()],
             branch_prefix: None,
             branch_globs: Vec::new(),
             workstreams: vec![Workstream {
                 project: "backup-restore".into(),
                 name: "workspace-separation".into(),
+                repo: "vxsuite".into(),
                 path: Some(PathBuf::from("/tmp/w")),
                 git: crate::model::GitState {
                     branch: branch.into(),

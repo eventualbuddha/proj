@@ -6,11 +6,12 @@
 //! the property that makes the layout worth having in the first place.
 
 use anyhow::Result;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::git;
 use crate::model::*;
+use crate::repo;
 
 pub const UNFILED: &str = "unfiled";
 
@@ -18,12 +19,6 @@ pub fn projects_root() -> PathBuf {
     std::env::var_os("PROJECTS_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join("projects"))
-}
-
-pub fn repo_path() -> PathBuf {
-    std::env::var_os("PROJ_REPO")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join("code/vxsuite"))
 }
 
 fn home() -> PathBuf {
@@ -117,12 +112,6 @@ fn glob_match(pattern: &str, s: &str) -> bool {
 /// Scan the root, read git, and return every project with its rows.
 pub fn scan() -> Result<Vec<Project>> {
     let root = projects_root();
-    let repo = repo_path();
-    let base = git::base_ref(&repo);
-
-    let worktrees = git::worktrees(&repo).unwrap_or_default();
-    let branches = git::local_branches(&repo).unwrap_or_default();
-
     let mut projects: Vec<Project> = Vec::new();
 
     let mut entries: Vec<_> = std::fs::read_dir(&root)?
@@ -131,6 +120,7 @@ pub fn scan() -> Result<Vec<Project>> {
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
+    let mut dirs = Vec::new();
     for entry in entries {
         let dir = entry.path();
         let readme = dir.join("README.md");
@@ -143,7 +133,7 @@ pub fn scan() -> Result<Vec<Project>> {
         let slug = entry.file_name().to_string_lossy().to_string();
         let fm = frontmatter(&readme);
 
-        let mut project = Project {
+        projects.push(Project {
             emoji: get(&fm, "emoji").unwrap_or("📁").to_string(),
             name: get(&fm, "name").unwrap_or(&slug).to_string(),
             kind: match get(&fm, "kind") {
@@ -151,24 +141,45 @@ pub fn scan() -> Result<Vec<Project>> {
                 _ => ProjectKind::Project,
             },
             status: get(&fm, "status").unwrap_or("active").to_string(),
+            repos: list(&fm, "repos"),
             branch_prefix: get(&fm, "branch-prefix").map(str::to_string),
             branch_globs: list(&fm, "branches"),
             readme,
             slug,
             workstreams: Vec::new(),
-        };
+        });
+        dirs.push(dir);
+    }
 
+    let repos: BTreeSet<String> = projects
+        .iter()
+        .flat_map(|p| p.repos.iter().cloned())
+        .filter(|r| repo::path(r).is_dir())
+        .collect();
+    let bases: HashMap<String, String> = git::par_map(repos.iter().collect(), |r| {
+        (r.clone(), git::base_ref(&repo::path(r)))
+    })
+    .into_iter()
+    .collect();
+
+    for (project, dir) in projects.iter_mut().zip(&dirs) {
         // Materialized rows: directories under the project that are worktrees.
-        let mut sub: Vec<_> = std::fs::read_dir(&dir)?
+        let mut sub: Vec<_> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok())
             .filter(|e| e.path().is_dir() && e.path().join(".git").exists())
             .collect();
         sub.sort_by_key(|e| e.file_name());
 
         let slug = project.slug.clone();
+        let fallback = project.repos.first().cloned().unwrap_or_default();
         project.workstreams = git::par_map(sub, |ws| {
             let path = ws.path();
             let name = ws.file_name().to_string_lossy().to_string();
+            let repo = repo::of_worktree(&path).unwrap_or_else(|| fallback.clone());
+            let base = bases
+                .get(&repo)
+                .cloned()
+                .unwrap_or_else(|| git::base_ref(&path));
 
             // Mid-rebase the worktree is detached and `rev-parse --abbrev-ref
             // HEAD` answers "HEAD", so the branch name has to come from the
@@ -187,44 +198,50 @@ pub fn scan() -> Result<Vec<Project>> {
             Workstream {
                 project: slug.clone(),
                 name,
+                repo,
                 path: Some(path),
                 git: git_state,
                 merged: Merged::No,
                 pr: None,
             }
         });
-
-        projects.push(project);
     }
 
     // Virtual rows: local branches with no worktree, claimed by whichever
     // project's prefix or globs match. This is the case that motivated the
     // split -- `brian/esm-lib-batch-4` is six commits and a draft PR with no
     // directory, and without this it renders nowhere.
-    let checked_out: HashSet<&String> = worktrees.keys().collect();
-    let orphans: Vec<&String> = branches
-        .iter()
-        .map(|(branch, _sha)| branch)
-        // `main` is the base, not a workstream.
-        .filter(|b| !checked_out.contains(b) && *b != "main")
-        .collect();
-    let states = git::par_map(orphans, |branch| {
-        (branch, git::state(&repo, branch, &base, false))
+    let mut orphans: Vec<(String, String)> = Vec::new();
+    for r in &repos {
+        let clone = repo::path(r);
+        let worktrees = git::worktrees(&clone).unwrap_or_default();
+        let checked_out: HashSet<&String> = worktrees.keys().collect();
+        for (branch, _sha) in git::local_branches(&clone).unwrap_or_default() {
+            // `main` is the base, not a workstream.
+            if !checked_out.contains(&branch) && branch != "main" {
+                orphans.push((r.clone(), branch));
+            }
+        }
+    }
+    let states = git::par_map(orphans, |(r, branch)| {
+        let state = git::state(&repo::path(&r), &branch, &bases[&r], false);
+        (r, branch, state)
     });
-    for (branch, git_state) in states {
+    for (r, branch, git_state) in states {
         // No project claims it -- but dropping it here is exactly the blindness
         // this tool exists to remove, so it goes to a synthetic "unfiled"
         // project instead. An unfiled row is a prompt: file it, or delete it.
-        let idx = match claim(&projects, branch) {
+        let idx = match claim(&projects, &r, &branch) {
             Some(i) => i,
             None => unfiled(&mut projects),
         };
 
-        let name = short_name(&projects[idx], branch);
+        let name = short_name(&projects[idx], &branch);
         let slug = projects[idx].slug.clone();
         projects[idx].workstreams.push(Workstream {
             project: slug,
             name,
+            repo: r,
             path: None,
             git: git_state,
             merged: Merged::No,
@@ -266,6 +283,7 @@ fn unfiled(projects: &mut Vec<Project>) -> usize {
         kind: ProjectKind::Project,
         status: "unfiled".to_string(),
         readme: PathBuf::new(),
+        repos: Vec::new(),
         branch_prefix: None,
         branch_globs: Vec::new(),
         workstreams: Vec::new(),
@@ -273,24 +291,26 @@ fn unfiled(projects: &mut Vec<Project>) -> usize {
     projects.len() - 1
 }
 
-/// Which project should own an orphan branch?
+/// Which project should own an orphan branch of `repo`? Only one that lists
+/// the repo can.
 ///
 /// A local branch is named `<project>/<workstream>`, so the first component is
 /// the answer and no guessing is required. The glob and prefix paths below are
 /// the fallback for branches predating the convention -- an escape hatch, not
 /// the mechanism. `branch-prefix: brian/` as a catch-all once swept four
 /// unrelated branches into one project, which is what the exact match prevents.
-fn claim(projects: &[Project], branch: &str) -> Option<usize> {
+fn claim(projects: &[Project], repo: &str, branch: &str) -> Option<usize> {
+    let has_repo = |p: &Project| p.repos.iter().any(|r| r == repo);
     if let Some((head, rest)) = branch.split_once('/') {
         if !rest.is_empty() {
-            if let Some(i) = projects.iter().position(|p| p.slug == head) {
+            if let Some(i) = projects.iter().position(|p| p.slug == head && has_repo(p)) {
                 return Some(i);
             }
         }
     }
 
     let mut best: Option<(usize, usize)> = None;
-    for (i, p) in projects.iter().enumerate() {
+    for (i, p) in projects.iter().enumerate().filter(|(_, p)| has_repo(p)) {
         for g in &p.branch_globs {
             if glob_match(g, branch) {
                 return Some(i);
@@ -326,4 +346,36 @@ fn short_name(project: &Project, branch: &str) -> String {
         }
     }
     branch.rsplit('/').next().unwrap_or(branch).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn project(slug: &str, repos: &[&str]) -> Project {
+        Project {
+            slug: slug.into(),
+            emoji: String::new(),
+            name: slug.into(),
+            kind: ProjectKind::Project,
+            status: "active".into(),
+            readme: PathBuf::new(),
+            repos: repos.iter().map(|r| r.to_string()).collect(),
+            branch_prefix: Some("brian/".into()),
+            branch_globs: Vec::new(),
+            workstreams: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_branch_is_only_claimed_by_a_project_in_its_repo() {
+        let projects = [
+            project("perf", &["vxsuite"]),
+            project("arlo-sec", &["arlo"]),
+        ];
+        assert_eq!(claim(&projects, "arlo", "arlo-sec/csrf"), Some(1));
+        assert_eq!(claim(&projects, "vxsuite", "arlo-sec/csrf"), None);
+        assert_eq!(claim(&projects, "arlo", "brian/old"), Some(1));
+        assert_eq!(claim(&projects, "vxsuite", "brian/old"), Some(0));
+    }
 }

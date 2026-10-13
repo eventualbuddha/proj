@@ -86,9 +86,11 @@ fn connect(app_tx: &Sender<Msg>) -> Option<Handle> {
                 Res::Cache { cache } => Msg::Refreshed(cache),
                 Res::Fetching { on } => Msg::Fetching(on),
                 Res::Failed { message } => Msg::RefreshFailed(message),
-                Res::Contexts { number, checks } => {
-                    Msg::Contexts(number, checks.into_iter().map(Into::into).collect())
-                }
+                Res::Contexts {
+                    repo,
+                    number,
+                    checks,
+                } => Msg::Contexts(repo, number, checks.into_iter().map(Into::into).collect()),
                 Res::Reviewers { logins } => Msg::Reviewers(logins),
                 // Only `--daemon-status` asks, and it does not run an App.
                 Res::Status { .. } => continue,

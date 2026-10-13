@@ -24,8 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use crate::app::{OWNER, REPO};
-use crate::github;
+use crate::github::{self, RepoBranch};
 use crate::ipc::{self, Req, Res, WireCheck};
 use crate::model::Check;
 
@@ -56,14 +55,15 @@ enum Ev {
     Gone(usize),
     Fetched(Box<github::Cache>),
     FetchFailed(String),
-    Contexts(u32, Vec<Check>),
+    Contexts(String, u32, Vec<Check>),
     Reviewers(usize, Vec<String>),
     Tick,
 }
 
 struct Client {
     out: Sender<String>,
-    branches: Vec<String>,
+    branches: Vec<RepoBranch>,
+    repos: Vec<String>,
     /// Whether this connection is a dashboard watching branches, as opposed to
     /// a `--daemon-status` asking a question and leaving. Only the former keeps
     /// the daemon alive: otherwise polling the status from a script would hold
@@ -82,9 +82,10 @@ struct Daemon {
     again: bool,
     /// Branches survive disconnection: the idle fetches are only useful if they
     /// keep asking about the same branches the next instance will want.
-    branches: Vec<String>,
-    contexts: HashMap<u32, (u64, Vec<Check>)>,
-    contexts_inflight: Vec<u32>,
+    branches: Vec<RepoBranch>,
+    repos: Vec<String>,
+    contexts: HashMap<(String, u32), (u64, Vec<Check>)>,
+    contexts_inflight: Vec<(String, u32)>,
     /// When the last dashboard left. `None` while any is connected.
     idle_since: Option<u64>,
     started_at: u64,
@@ -124,11 +125,12 @@ pub fn run() -> Result<()> {
     let mut d = Daemon {
         clients: HashMap::new(),
         next_id: 0,
-        cache: github::load_cache(OWNER, REPO),
+        cache: github::load_cache(),
         fetched_at: 0,
         fetching: false,
         again: false,
         branches: Vec::new(),
+        repos: Vec::new(),
         contexts: HashMap::new(),
         contexts_inflight: Vec::new(),
         idle_since: Some(github::now()),
@@ -182,13 +184,15 @@ impl Daemon {
                     self.broadcast(&Res::Fetching { on: false });
                     self.broadcast(&Res::Failed { message });
                 }
-                Ev::Contexts(number, checks) => {
-                    self.contexts_inflight.retain(|n| *n != number);
+                Ev::Contexts(repo, number, checks) => {
+                    let key = (repo, number);
+                    self.contexts_inflight.retain(|k| *k != key);
                     self.contexts
-                        .insert(number, (github::now(), checks.clone()));
+                        .insert(key.clone(), (github::now(), checks.clone()));
                     // To everyone: several instances watching the same PR is the
                     // normal case, and they all key the answer by number.
                     self.broadcast(&Res::Contexts {
+                        repo: key.0,
                         number,
                         checks: checks.iter().map(WireCheck::from).collect(),
                     });
@@ -253,6 +257,7 @@ impl Daemon {
             Client {
                 out,
                 branches: Vec::new(),
+                repos: Vec::new(),
                 watching: false,
             },
         );
@@ -271,28 +276,32 @@ impl Daemon {
     /// Handle one request. Returns true to stop the daemon.
     fn request(&mut self, id: usize, req: Req) -> bool {
         match req {
-            Req::Branches { branches } => {
+            Req::Branches { branches, repos } => {
                 if let Some(c) = self.clients.get_mut(&id) {
                     c.branches = branches;
+                    c.repos = repos;
                     c.watching = true;
                 }
                 self.reassess_idle();
                 let known = std::mem::take(&mut self.branches);
-                self.branches = self.union(&known);
+                self.branches = union(self.clients.values().map(|c| &c.branches), &known);
+                let known_repos = std::mem::take(&mut self.repos);
+                self.repos = union(self.clients.values().map(|c| &c.repos), &known_repos);
                 // A branch nobody has asked GitHub about yet is a row that will
                 // sit blank until the next minute is up, which is most of the
                 // time you are looking at a branch you just made.
-                if self.branches.iter().any(|b| !known.contains(b)) {
+                if self.branches.iter().any(|b| !known.contains(b))
+                    || self.repos.iter().any(|r| !known_repos.contains(r))
+                {
                     self.fetch();
                 }
             }
             Req::Refresh => self.fetch(),
-            Req::Contexts { number } => self.contexts(id, number),
-            Req::Reviewers { number } => {
+            Req::Contexts { repo, number } => self.contexts(id, repo, number),
+            Req::Reviewers { repo, number } => {
                 let tx = self.tx.clone();
                 std::thread::spawn(move || {
-                    let logins =
-                        github::suggested_reviewers(OWNER, REPO, number).unwrap_or_default();
+                    let logins = github::suggested_reviewers(&repo, number).unwrap_or_default();
                     let _ = tx.send(Ev::Reviewers(id, logins));
                 });
             }
@@ -305,27 +314,14 @@ impl Daemon {
         false
     }
 
-    /// The branch union over every connected instance, plus what was being
-    /// asked for before the last one left.
-    fn union(&self, carried: &[String]) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        let live = self.clients.values().flat_map(|c| c.branches.iter());
-        // Carried branches last: a branch still open in a window outranks one
-        // left over from a window that closed.
-        for b in live.chain(carried.iter()) {
-            if !b.is_empty() && !out.contains(b) {
-                out.push(b.clone());
-            }
-        }
-        out
-    }
-
-    fn contexts(&mut self, id: usize, number: u32) {
-        if let Some((at, checks)) = self.contexts.get(&number) {
+    fn contexts(&mut self, id: usize, repo: String, number: u32) {
+        let key = (repo, number);
+        if let Some((at, checks)) = self.contexts.get(&key) {
             if github::now().saturating_sub(*at) < CONTEXTS_TTL {
                 self.send(
                     id,
                     &Res::Contexts {
+                        repo: key.0,
                         number,
                         checks: checks.iter().map(WireCheck::from).collect(),
                     },
@@ -333,16 +329,16 @@ impl Daemon {
                 return;
             }
         }
-        if self.contexts_inflight.contains(&number) {
+        if self.contexts_inflight.contains(&key) {
             return;
         }
-        self.contexts_inflight.push(number);
+        self.contexts_inflight.push(key.clone());
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             // An empty list on failure, matching what an instance fetching for
             // itself does: the row settles into "no names" rather than spinning.
-            let list = github::contexts(OWNER, REPO, number).unwrap_or_default();
-            let _ = tx.send(Ev::Contexts(number, list));
+            let list = github::contexts(&key.0, number).unwrap_or_default();
+            let _ = tx.send(Ev::Contexts(key.0, number, list));
         });
     }
 
@@ -370,11 +366,10 @@ impl Daemon {
         }
         self.fetching = true;
         self.broadcast(&Res::Fetching { on: true });
-        let branches = self.branches.clone();
+        let (branches, repos) = (self.branches.clone(), self.repos.clone());
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let repo = crate::discover::repo_path();
-            let ev = match github::fetch_and_refresh(&repo, OWNER, REPO, &branches) {
+            let ev = match github::fetch_and_refresh(&branches, &repos) {
                 Ok(cache) => Ev::Fetched(Box::new(cache)),
                 Err(e) => Ev::FetchFailed(format!("{e:#}")),
             };
@@ -455,6 +450,22 @@ impl Daemon {
     }
 }
 
+/// The union over every connected instance, plus what was being asked for
+/// before the last one left. Carried entries last: one still open in a window
+/// outranks one left over from a window that closed.
+fn union<'a, T: Clone + PartialEq + 'a>(
+    live: impl Iterator<Item = &'a Vec<T>>,
+    carried: &'a [T],
+) -> Vec<T> {
+    let mut out: Vec<T> = Vec::new();
+    for b in live.flatten().chain(carried.iter()) {
+        if !out.contains(b) {
+            out.push(b.clone());
+        }
+    }
+    out
+}
+
 /// Take the socket, or discover that someone else already has it.
 ///
 /// The lock file closes the window between "nobody answered" and "I have bound"
@@ -532,11 +543,19 @@ mod tests {
             fetching: false,
             again: false,
             branches: Vec::new(),
+            repos: Vec::new(),
             contexts: HashMap::new(),
             contexts_inflight: Vec::new(),
             idle_since: Some(github::now()),
             started_at: github::now(),
             tx,
+        }
+    }
+
+    fn rb(branch: &str) -> RepoBranch {
+        RepoBranch {
+            repo: "vxsuite".into(),
+            branch: branch.into(),
         }
     }
 
@@ -551,7 +570,8 @@ mod tests {
             id,
             Client {
                 out,
-                branches: branches.iter().map(|b| b.to_string()).collect(),
+                branches: branches.iter().map(|b| rb(b)).collect(),
+                repos: vec!["vxsuite".into()],
                 watching,
             },
         );
@@ -588,9 +608,10 @@ mod tests {
         let mut d = daemon();
         let (_a, _qa) = client(&mut d, &["brian/a", "brian/b"], true);
         let (_b, _qb) = client(&mut d, &["brian/b", "brian/c"], true);
-        let mut union = d.union(&[]);
-        union.sort();
-        assert_eq!(union, ["brian/a", "brian/b", "brian/c"]);
+        let union = union(d.clients.values().map(|c| &c.branches), &[]);
+        let mut names: Vec<&str> = union.iter().map(|b| b.branch.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["brian/a", "brian/b", "brian/c"]);
     }
 
     /// The idle fetches only warm the cache if they keep asking about the same
@@ -598,7 +619,10 @@ mod tests {
     #[test]
     fn branches_outlive_the_window_that_asked_for_them() {
         let d = daemon();
-        assert_eq!(d.union(&["brian/a".to_string()]), ["brian/a"]);
+        assert_eq!(
+            union(d.clients.values().map(|c| &c.branches), &[rb("brian/a")]),
+            [rb("brian/a")]
+        );
     }
 
     /// Also why a failed fetch moves `fetched_at`: an unreachable GitHub would
@@ -607,7 +631,7 @@ mod tests {
     fn a_cache_that_was_just_fetched_is_not_fetched_again_on_the_next_tick() {
         let mut d = daemon();
         let (_id, _q) = client(&mut d, &["brian/a"], true);
-        d.branches = vec!["brian/a".into()];
+        d.branches = vec![rb("brian/a")];
         d.fetched_at = github::now();
         assert!(!d.tick());
         assert!(!d.fetching, "the next attempt waits for the interval");

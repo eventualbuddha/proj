@@ -6,9 +6,10 @@
 # review, usually one branch and one PR. See ~/projects/README.md for the full
 # design; this file is the phase-1 shell half of it.
 #
-# A workstream directory IS the worktree. The rare cross-repo workstream (a
-# directory of per-repo worktrees instead) is not handled here -- it is phase 4,
-# and nothing below assumes it will not arrive.
+# A workstream directory IS the worktree, added from the canonical clone of the
+# first repo in its project's `repos:` -- ~/code/<repo>, or $PROJ_CODE_ROOT/<repo>.
+# The rare cross-repo workstream (a directory of per-repo worktrees instead) is
+# not handled here.
 
 function proj --description "Manage project worktrees under ~/projects"
     # Bare `proj` opens the dashboard. It writes what you chose to a temp file on
@@ -65,7 +66,7 @@ function proj --description "Manage project worktrees under ~/projects"
             __proj_complete_workstreams
 
         case __branches
-            __proj_complete_branches
+            __proj_complete_branches $argv
 
         case '*'
             echo "proj: unknown command '$cmd'" >&2
@@ -83,7 +84,9 @@ function __proj_help
     echo "                                          The branch defaults to <project>/<workstream>"
     echo "                                          prefixed per the project's README frontmatter;"
     echo "                                          override with --branch-name"
-    echo "                                          Runs pnpm install and pnpm build"
+    echo "                                          Added from ~/code/<repo>, the first of the"
+    echo "                                          project's repos; runs pnpm install and pnpm"
+    echo "                                          build where the repo uses pnpm"
     echo "                                          With --rebase, rebase on main before building"
     echo "                                          A project that does not exist yet is created"
     echo "                                          first, prompting for its README frontmatter"
@@ -181,13 +184,17 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
                 else
                     echo "Creating worktree for '$parts[2]' on branch '$parts[3]'..."
                 end
-                __proj_new "$parts[2]" --branch-name "$parts[3]" $base
+                set -l repo
+                if test (count $parts) -ge 5; and test -n "$parts[5]"
+                    set repo --repo "$parts[5]"
+                end
+                __proj_new "$parts[2]" --branch-name "$parts[3]" $base $repo
                 return $status
 
             case new-project
                 # One line of output on success, and the dashboard reopens on
                 # the new project: the next thing to do there is `n`.
-                if __proj_create_project "$parts[2]" "$parts[3]" "$parts[4]"
+                if __proj_create_project "$parts[2]" "$parts[3]" "$parts[4]" "$parts[5]"
                     set pause 0
                 end
 
@@ -237,20 +244,20 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
                 __proj_push "$parts[2]" "$parts[3]" --force
 
             case gh-ready
-                gh pr ready "$parts[2]" --repo votingworks/vxsuite
+                gh pr ready "$parts[2]" --repo "$parts[3]"
 
             case gh-review
-                gh pr edit "$parts[2]" --repo votingworks/vxsuite --add-reviewer "$parts[3]"
+                gh pr edit "$parts[2]" --repo "$parts[4]" --add-reviewer "$parts[3]"
 
             case gh-ready-review
-                gh pr ready "$parts[2]" --repo votingworks/vxsuite
-                and gh pr edit "$parts[2]" --repo votingworks/vxsuite --add-reviewer "$parts[3]"
+                gh pr ready "$parts[2]" --repo "$parts[4]"
+                and gh pr edit "$parts[2]" --repo "$parts[4]" --add-reviewer "$parts[3]"
 
             case ci-rerun
                 __proj_ci_rerun "$parts[2]"
 
             case review-checkout
-                __proj_review_checkout "$parts[2]" "$parts[3]"
+                __proj_review_checkout "$parts[2]" "$parts[3]" "$parts[4]"
                 return $status
 
             case review-update
@@ -263,7 +270,7 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
                 set reopen
 
             case delete-branch
-                __proj_delete_branch "$parts[3]" "$parts[4]"
+                __proj_delete_branch "$parts[3]" "$parts[4]" "$parts[5]"
                 set reopen
 
             case '*'
@@ -286,14 +293,16 @@ end
 
 function __proj_ci_rerun --description "Re-run the failed jobs of the workflow a CircleCI job URL belongs to"
     set -l url "$argv[1]"
-    set -l job (string match -r '/(\d+)/?$' -- "$url")[2]
-    if test -z "$job"
-        echo "proj: no job number in $url" >&2
+    set -l m (string match -r -g '/gh/([^/]+/[^/]+)/(\d+)/?$' -- "$url")
+    if test (count $m) -ne 2
+        echo "proj: no project and job number in $url" >&2
         return 1
     end
+    set -l project $m[1]
+    set -l job $m[2]
 
     set -l api https://circleci.com/api
-    set -l workflow (curl -sS --max-time 30 "$api/v1.1/project/github/votingworks/vxsuite/$job" | jq -r '.workflows.workflow_id // empty')
+    set -l workflow (curl -sS --max-time 30 "$api/v1.1/project/github/$project/$job" | jq -r '.workflows.workflow_id // empty')
     if test -z "$workflow"
         echo "proj: could not resolve job $job to a workflow" >&2
         return 1
@@ -307,12 +316,15 @@ function __proj_ci_rerun --description "Re-run the failed jobs of the workflow a
         -d '{"from_failed": true}' | jq -r '.message // .'
 end
 
-function __proj_review_checkout --description "Check out PR NUMBER into the review worktree named DIR"
+function __proj_review_checkout --description "Check out REPO's PR NUMBER into the review worktree named DIR"
     set -l number "$argv[1]"
     # The whole directory name, number and all, decided by the dashboard: it is
     # the PR number in that name that lets a later run pair the worktree back up
     # with the review, so the two must agree on it.
     set -l name "$argv[2]"
+    set -l repo "$argv[3]"
+    set -l clone (__proj_clone "$repo")
+    or return 1
     set -l root (__proj_root)/review
     set -l wt_path "$root/$name"
 
@@ -324,18 +336,18 @@ function __proj_review_checkout --description "Check out PR NUMBER into the revi
 
     if not test -f "$root/README.md"
         mkdir -p "$root"
-        printf '%s\n' '---' 'emoji: "👀"' 'kind: review' 'name: Code review' 'repos: [vxsuite]' '---' '' '# Code review' '' 'Worktrees checked out for review. Disposable.' > "$root/README.md"
+        printf '%s\n' '---' 'emoji: "👀"' 'kind: review' 'name: Code review' "repos: [$repo]" '---' '' '# Code review' '' 'Worktrees checked out for review. Disposable.' > "$root/README.md"
     end
 
     set -l branch "review/$number"
     echo "Fetching PR #$number..."
-    git -C (__proj_repo) fetch --quiet origin "+refs/pull/$number/head:refs/heads/$branch"
+    git -C "$clone" fetch --quiet origin "+refs/pull/$number/head:refs/heads/$branch"
     or begin
         echo "proj: could not fetch PR #$number" >&2
         return 1
     end
 
-    __proj_worktree_add "$wt_path" "$wt_path" "$branch"
+    __proj_worktree_add "$clone" "$wt_path" "$wt_path" "$branch"
     or return 1
 
     __proj_goto "$wt_path"
@@ -403,12 +415,29 @@ end
 # Paths and configuration
 # ---------------------------------------------------------------------------
 
-# The canonical clone every worktree is added from. Single-repo for now; phase 4
-# turns this into a lookup keyed by the repo directory name.
-function __proj_repo --description "Print the canonical clone for a repo (default vxsuite)"
-    set -l repo $argv[1]
-    test -n "$repo"; or set repo vxsuite
-    echo ~/code/$repo
+function __proj_clone --description "Print the canonical clone of REPO, failing if there is none"
+    set -l root ~/code
+    set -q PROJ_CODE_ROOT; and set root $PROJ_CODE_ROOT
+    set -l clone "$root/$argv[1]"
+    if test -z "$argv[1]"; or not test -e "$clone/.git"
+        echo "proj: no clone of '$argv[1]' at $clone" >&2
+        return 1
+    end
+    echo $clone
+end
+
+function __proj_project_repos --description "Print each repo in PROJECT's repos: list"
+    set -l raw (__proj_meta "$argv[1]" repos)
+    for r in (string split , -- (string trim -c '[] ' -- "$raw"))
+        set r (string trim -c " \"'" -- "$r")
+        test -n "$r"; and echo $r
+    end
+end
+
+function __proj_clone_of --description "Print the canonical clone the worktree at PATH was added from"
+    set -l common (git -C "$argv[1]" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+    or return 1
+    string replace -r '/[^/]*$' '' -- "$common"
 end
 
 function __proj_root --description "Print the projects root"
@@ -559,15 +588,16 @@ end
 # Git helpers
 # ---------------------------------------------------------------------------
 
-function __proj_local_branch --description "Succeed if BRANCH exists locally"
-    git -C (__proj_repo) show-ref --verify --quiet "refs/heads/$argv[1]"
+function __proj_local_branch --description "Succeed if BRANCH exists locally in the repo at DIR"
+    git -C "$argv[1]" show-ref --verify --quiet "refs/heads/$argv[2]"
 end
 
-function __proj_remote_ref --description "Print <remote>/<branch> if an already-fetched remote branch exists"
-    set -l branch "$argv[1]"
+function __proj_remote_ref --description "Print <remote>/<branch> if an already-fetched remote BRANCH exists in the repo at DIR"
+    set -l dir "$argv[1]"
+    set -l branch "$argv[2]"
 
-    for remote in (git -C (__proj_repo) remote)
-        if git -C (__proj_repo) show-ref --verify --quiet "refs/remotes/$remote/$branch"
+    for remote in (git -C "$dir" remote)
+        if git -C "$dir" show-ref --verify --quiet "refs/remotes/$remote/$branch"
             echo "$remote/$branch"
             return 0
         end
@@ -576,13 +606,14 @@ function __proj_remote_ref --description "Print <remote>/<branch> if an already-
     return 1
 end
 
-function __proj_fetch_branch --description "Look for BRANCH on the remotes, fetch it, print <remote>/<branch>"
-    set -l branch "$argv[1]"
+function __proj_fetch_branch --description "Look for BRANCH on the remotes of the repo at DIR, fetch it, print <remote>/<branch>"
+    set -l dir "$argv[1]"
+    set -l branch "$argv[2]"
 
-    for remote in (git -C (__proj_repo) remote)
-        if git -C (__proj_repo) ls-remote --exit-code --heads "$remote" "refs/heads/$branch" >/dev/null 2>&1
+    for remote in (git -C "$dir" remote)
+        if git -C "$dir" ls-remote --exit-code --heads "$remote" "refs/heads/$branch" >/dev/null 2>&1
             echo "Fetching '$branch' from $remote..." >&2
-            if git -C (__proj_repo) fetch --quiet "$remote" "+refs/heads/$branch:refs/remotes/$remote/$branch"
+            if git -C "$dir" fetch --quiet "$remote" "+refs/heads/$branch:refs/remotes/$remote/$branch"
                 echo "$remote/$branch"
                 return 0
             end
@@ -592,17 +623,18 @@ function __proj_fetch_branch --description "Look for BRANCH on the remotes, fetc
     return 1
 end
 
-function __proj_resolve_branch --description "Print <branch> or <remote>/<branch> if it exists anywhere, fetching if needed"
-    set -l branch "$argv[1]"
+function __proj_resolve_branch --description "Print <branch> or <remote>/<branch> if BRANCH exists anywhere for the repo at DIR, fetching if needed"
+    set -l dir "$argv[1]"
+    set -l branch "$argv[2]"
 
-    if __proj_local_branch "$branch"
+    if __proj_local_branch "$dir" "$branch"
         echo "$branch"
         return 0
     end
 
-    set -l remote_ref (__proj_remote_ref "$branch")
+    set -l remote_ref (__proj_remote_ref "$dir" "$branch")
     if test -z "$remote_ref"
-        set remote_ref (__proj_fetch_branch "$branch")
+        set remote_ref (__proj_fetch_branch "$dir" "$branch")
     end
 
     if test -n "$remote_ref"
@@ -624,11 +656,11 @@ function __proj_rebase_main --description "Rebase the worktree at PATH onto the 
 
     # Prefer the remote's main so the rebase picks up commits the local main
     # has not been updated to yet.
-    set -l onto (__proj_fetch_branch main)
+    set -l onto (__proj_fetch_branch "$wt_path" main)
     if test -z "$onto"
-        set onto (__proj_remote_ref main)
+        set onto (__proj_remote_ref "$wt_path" main)
     end
-    if test -z "$onto"; and __proj_local_branch main
+    if test -z "$onto"; and __proj_local_branch "$wt_path" main
         set onto main
     end
     if test -z "$onto"
@@ -641,6 +673,10 @@ function __proj_rebase_main --description "Rebase the worktree at PATH onto the 
 end
 
 function __proj_build --description "Install dependencies and build the worktree in the current directory"
+    if not test -f pnpm-lock.yaml
+        echo "No pnpm-lock.yaml here; skipping the build"
+        return 0
+    end
     pnpm install
     and pnpm build
 end
@@ -655,10 +691,10 @@ function __proj_rebase_and_build --description "Rebase the worktree at PATH onto
     __proj_build
 end
 
-function __proj_worktree_add --description "Add the worktree at PATH (git worktree add ARGS...), reflink-cloning the canonical clone into it where the filesystem allows"
-    set -l wt_path "$argv[1]"
-    set -e argv[1]
-    set -l repo (__proj_repo)
+function __proj_worktree_add --description "Add the worktree at PATH from the clone REPO (git worktree add ARGS...), reflink-cloning the clone into it where the filesystem allows"
+    set -l repo "$argv[1]"
+    set -l wt_path "$argv[2]"
+    set -e argv[1..2]
 
     git -C "$repo" worktree add --no-checkout $argv
     or return 1
@@ -694,6 +730,7 @@ function __proj_new
     set -l target ""
     set -l base_branch ""
     set -l branch_name ""
+    set -l repo ""
     set -l rebase 0
 
     set -l i 1
@@ -715,6 +752,14 @@ function __proj_new
                     set branch_name $argv[$i]
                 else
                     echo "proj new: --branch-name requires an argument" >&2
+                    return 1
+                end
+            case --repo
+                set i (math $i + 1)
+                if test $i -le (count $argv)
+                    set repo $argv[$i]
+                else
+                    echo "proj new: --repo requires an argument" >&2
                     return 1
                 end
             case '-*'
@@ -764,6 +809,16 @@ function __proj_new
         return 1
     end
 
+    if test -z "$repo"
+        set repo (__proj_project_repos "$project")[1]
+        if test -z "$repo"
+            echo "proj new: $root/$project/README.md names no repos; add e.g. 'repos: [vxsuite]'" >&2
+            return 1
+        end
+    end
+    set -l clone (__proj_clone "$repo")
+    or return 1
+
     # The branch name IS the workstream's identity: `<project>/<workstream>`,
     # locally and on the remote. Nothing to configure
     # and nothing to guess -- a path and a branch name carry the same
@@ -773,16 +828,16 @@ function __proj_new
     end
 
     set -l git_args
-    if __proj_local_branch "$branch_name"
+    if __proj_local_branch "$clone" "$branch_name"
         if test -n "$base_branch"
             echo "proj new: branch '$branch_name' already exists, ignoring --branch $base_branch" >&2
         end
         echo "Checking out existing branch '$branch_name' at $wt_path..."
         set git_args "$wt_path" "$branch_name"
     else
-        set -l remote_ref (__proj_remote_ref "$branch_name")
+        set -l remote_ref (__proj_remote_ref "$clone" "$branch_name")
         if test -z "$remote_ref"
-            set remote_ref (__proj_fetch_branch "$branch_name")
+            set remote_ref (__proj_fetch_branch "$clone" "$branch_name")
         end
 
         if test -n "$remote_ref"
@@ -795,7 +850,7 @@ function __proj_new
             set -l base "$base_branch"
             test -n "$base"; or set base main
 
-            set -l start (__proj_resolve_branch "$base")
+            set -l start (__proj_resolve_branch "$clone" "$base")
             if test -z "$start"
                 echo "proj new: base branch '$base' not found locally or on any remote" >&2
                 return 1
@@ -808,7 +863,7 @@ function __proj_new
         end
     end
 
-    __proj_worktree_add "$wt_path" $git_args
+    __proj_worktree_add "$clone" "$wt_path" $git_args
     or begin
         echo "proj new: failed to create worktree" >&2
         return 1
@@ -841,7 +896,7 @@ function __proj_create_project --description "Create PROJECT's directory and REA
     set -l project "$argv[1]"
     set -l name "$argv[2]"
     set -l emoji "$argv[3]"
-    set -l repos vxsuite
+    set -l repos "$argv[4]"
     set -l project_status active
 
     if test -z "$project"
@@ -858,8 +913,8 @@ function __proj_create_project --description "Create PROJECT's directory and REA
     end
 
     # Prompt for what was not passed, and only when there is someone to ask.
-    # The dashboard hands over all three fields; the command line hands over
-    # the directory and asks for the rest.
+    # The dashboard hands over every field; the command line hands over the
+    # directory and asks for the rest.
     if test -z "$name"
         if not isatty stdin
             echo "proj new: no project '$project' (expected $root/$project/README.md)" >&2
@@ -872,14 +927,25 @@ function __proj_create_project --description "Create PROJECT's directory and REA
         end
         read -P "  emoji [📁]: " emoji
         or return 1
-        read -P "  repos [$repos]: " -l answer
-        or return 1
-        test -n "$answer"; and set repos (string trim -c '[] ' -- "$answer")
+        # Defaults to the repo you are standing in, if any.
+        set -l clone (__proj_clone_of (pwd))
+        and set repos (string replace -r '.*/' '' -- "$clone")
+        set -l answer
+        while true
+            read -P "  repos [$repos]: " answer
+            or return 1
+            test -n "$answer"; and set repos (string trim -c '[] ' -- "$answer")
+            test -n "$repos"; and break
+        end
         read -P "  status [$project_status]: " answer
         or return 1
         test -n "$answer"; and set project_status "$answer"
     end
     test -n "$emoji"; or set emoji 📁
+    for r in (string split , -- "$repos")
+        __proj_clone (string trim -- "$r") >/dev/null
+        or echo "proj new: clone it there before adding workstreams" >&2
+    end
 
     mkdir -p "$root/$project"
     or return 1
@@ -957,9 +1023,9 @@ function __proj_archive --description "Move a project to ARCHIVE"
     for dir in $to/*/
         test -e "$dir/.git"; and set -a moved (string trim -r -c / -- "$dir")
     end
-    if test (count $moved) -gt 0
-        git -C (__proj_repo) worktree repair $moved &>/dev/null
-        or echo "proj archive: git worktree repair failed; run it by hand" >&2
+    for dir in $moved
+        git -C "$dir" worktree repair &>/dev/null
+        or echo "proj archive: git worktree repair failed in $dir; run it by hand" >&2
     end
 
     echo "Archived '$project' to $to"
@@ -1015,6 +1081,11 @@ function __proj_remove
     set -l wt_path (realpath "$parts[3]" 2>/dev/null; or echo "$parts[3]")
 
     set -l branch (git -C "$wt_path" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    set -l clone (__proj_clone_of "$wt_path")
+    or begin
+        echo "proj rm: $wt_path is not a git worktree" >&2
+        return 1
+    end
 
     if test $force -eq 0
         set -l dirty (git -C "$wt_path" status --porcelain 2>/dev/null)
@@ -1054,7 +1125,7 @@ function __proj_remove
         echo "Changed directory to "(__proj_root)/$project
     end
 
-    git -C (__proj_repo) worktree remove "$wt_path" --force
+    git -C "$clone" worktree remove "$wt_path" --force
     or begin
         echo "proj rm: failed to remove worktree" >&2
         return 1
@@ -1065,20 +1136,21 @@ function __proj_remove
         # asks about ancestry, and a squash-merged branch is not an ancestor of
         # main -- so the branch this most wants to delete is exactly the one it
         # would otherwise keep forever.
-        if git -C (__proj_repo) branch -D "$branch" >/dev/null 2>&1
+        if git -C "$clone" branch -D "$branch" >/dev/null 2>&1
             echo "Deleted branch '$branch'"
         else
-            echo "Kept branch '$branch' (delete it with: git -C "(__proj_repo)" branch -D $branch)"
+            echo "Kept branch '$branch' (delete it with: git -C $clone branch -D $branch)"
         end
     end
 
     echo "Workstream '$project/$workstream' removed"
 end
 
-function __proj_delete_branch --description "Delete a branch with no worktree, locally and on origin"
+function __proj_delete_branch --description "Delete BRANCH (REMOTE on origin) of REPO, which has no worktree, locally and on origin"
     set -l branch "$argv[1]"
     set -l remote "$argv[2]"
-    set -l repo (__proj_repo)
+    set -l repo (__proj_clone "$argv[3]")
+    or return 1
 
     echo "Deleting branch '$branch'..."
     # `-D`, not `-d`: a squash-merged branch is not an ancestor of main, and the
@@ -1135,7 +1207,7 @@ function __proj_status
 
         # Drift against the remote's main, which is what "behind" actually
         # means day to day -- a stale local main would understate it.
-        set -l base (__proj_remote_ref main)
+        set -l base (__proj_remote_ref "$path" main)
         test -n "$base"; or set base main
 
         set -l drift ""
@@ -1294,16 +1366,33 @@ function __proj_complete_workstreams --description "Print 'project/workstream<TA
     end
 end
 
-function __proj_complete_branches --description "Print 'branch<TAB>description' for local and remote branches"
+function __proj_complete_branches --description "Print 'branch<TAB>description' for the branches of the repo of the project named in ARGS"
+    # ARGS is the command line so far; its `<project>/...` picks the repo.
+    set -l repo
+    for arg in $argv
+        set -l project (string split -m1 / -- "$arg")[1]
+        if test -f (__proj_root)/$project/README.md
+            set repo (__proj_project_repos "$project")[1]
+            break
+        end
+    end
+    set -l clone
+    if test -n "$repo"
+        set clone (__proj_clone "$repo" 2>/dev/null)
+    else
+        set clone (__proj_clone_of (pwd))
+    end
+    test -n "$clone"; or return 0
+
     set -l seen
 
-    for branch in (git -C (__proj_repo) for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)
+    for branch in (git -C "$clone" for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)
         set -a seen "$branch"
         printf '%s\t%s\n' "$branch" "local branch"
     end
 
-    for remote in (git -C (__proj_repo) remote)
-        for ref in (git -C (__proj_repo) for-each-ref --format='%(refname:short)' "refs/remotes/$remote" 2>/dev/null)
+    for remote in (git -C "$clone" remote)
+        for ref in (git -C "$clone" for-each-ref --format='%(refname:short)' "refs/remotes/$remote" 2>/dev/null)
             set -l branch (string replace -- "$remote/" "" "$ref")
             test "$branch" != HEAD; or continue
             contains -- "$branch" $seen; and continue

@@ -22,12 +22,20 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::*;
+use crate::repo::{self, GitHub};
+
+/// A branch to ask about, and the repo (canonical clone name) it is in.
+#[derive(serde::Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RepoBranch {
+    pub repo: String,
+    pub branch: String,
+}
 
 /// Build the aliased multi-branch query and the variables it needs.
 fn list_query(branches: &[String]) -> (String, Vec<(String, String)>) {
@@ -108,6 +116,8 @@ pub struct Cache {
 
 #[derive(serde::Serialize, Deserialize, Clone)]
 pub struct CachedReview {
+    #[serde(default)]
+    pub repo: String,
     pub number: u32,
     pub title: String,
     pub url: String,
@@ -121,6 +131,8 @@ pub struct CachedReview {
 }
 #[derive(serde::Serialize, Deserialize, Clone)]
 pub struct CachedPr {
+    #[serde(default)]
+    pub repo: String,
     pub branch: String,
     pub number: u32,
     pub state: String,
@@ -143,25 +155,30 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
-fn cache_path(owner: &str, name: &str) -> PathBuf {
+fn cache_path() -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache"));
-    base.join("proj").join(format!("gh-{owner}-{name}.json"))
+    base.join("proj").join("gh.json")
 }
 
-pub fn load_cache(owner: &str, name: &str) -> Option<Cache> {
-    let text = std::fs::read_to_string(cache_path(owner, name)).ok()?;
+pub fn load_cache() -> Option<Cache> {
+    let text = std::fs::read_to_string(cache_path()).ok()?;
     serde_json::from_str(&text).ok()
 }
 
-fn save_cache(owner: &str, name: &str, cache: &Cache) -> Result<()> {
-    let path = cache_path(owner, name);
+fn save_cache(cache: &Cache) -> Result<()> {
+    let path = cache_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(path, serde_json::to_string(cache)?)?;
     Ok(())
+}
+
+fn github_of(repo: &str) -> Result<GitHub> {
+    repo::github(repo)
+        .with_context(|| format!("{} has no GitHub origin", repo::path(repo).display()))
 }
 
 fn gh(args: &[String]) -> Result<Vec<u8>> {
@@ -178,42 +195,56 @@ fn gh(args: &[String]) -> Result<Vec<u8>> {
 /// `git fetch` and the API refresh, side by side. They share nothing but a
 /// network connection, and the fetch is a second or two that the PR state
 /// would otherwise sit behind.
-pub fn fetch_and_refresh(
-    repo: &Path,
-    owner: &str,
-    name: &str,
-    branches: &[String],
-) -> Result<Cache> {
+pub fn fetch_and_refresh(branches: &[RepoBranch], repos: &[String]) -> Result<Cache> {
     std::thread::scope(|s| {
         // Failure is not fatal: offline, the local answer is still worth
         // showing, and the API call fails on its own terms.
-        s.spawn(|| {
-            let _ = crate::git::fetch_prune(repo);
-        });
-        refresh(owner, name, branches)
+        for r in repos {
+            s.spawn(move || {
+                let _ = crate::git::fetch_prune(&repo::path(r));
+            });
+        }
+        refresh(branches, repos)
     })
 }
 
 /// Hit the API and rewrite the cache. Slow enough to belong on a background
-/// thread; `branches` are *remote* names, since `headRefName` is the only name
-/// GitHub knows.
-pub fn refresh(owner: &str, name: &str, branches: &[String]) -> Result<Cache> {
+/// thread; branches are *remote* names, since `headRefName` is the only name
+/// GitHub knows. The review queue covers every repo in `repos`.
+pub fn refresh(branches: &[RepoBranch], repos: &[String]) -> Result<Cache> {
+    let mut by_repo: Vec<(String, GitHub, Vec<String>)> = Vec::new();
+    for b in branches {
+        if let Some(i) = by_repo.iter().position(|(r, _, _)| *r == b.repo) {
+            by_repo[i].2.push(b.branch.clone());
+        } else if let Some(gh) = repo::github(&b.repo) {
+            by_repo.push((b.repo.clone(), gh, vec![b.branch.clone()]));
+        }
+    }
+    let review_repos: Vec<(String, GitHub)> = repos
+        .iter()
+        .filter_map(|r| repo::github(r).map(|gh| (r.clone(), gh)))
+        .collect();
+
     // Chunked because the query grows with the branch count and a variable list
     // is not free. lazygit uses 10 per request with 5 concurrent; chunks of 20
     // are well inside what the API is happy with here. Every chunk and the
     // review queue go out at once: each is a second of waiting on GitHub, and
     // in series they were the whole of a fetch.
     let (chunks, reviews) = std::thread::scope(|s| {
-        let chunks: Vec<_> = branches
-            .chunks(20)
-            .map(|chunk| s.spawn(move || pr_chunk(owner, name, chunk)))
+        let chunks: Vec<_> = by_repo
+            .iter()
+            .flat_map(|(r, gh, branches)| {
+                branches
+                    .chunks(20)
+                    .map(move |chunk| s.spawn(move || pr_chunk(r, gh, chunk)))
+            })
             .collect();
         // The review queue rides along on the same cycle. A failure here is
         // not a failure of the whole refresh -- an empty queue and an
         // unreachable one look the same on screen, but losing the workstream
         // PRs too would be worse.
-        let reviews = s.spawn(|| match viewer(owner) {
-            Ok((me, teams)) => review_queue(owner, name, &me, &teams).unwrap_or_default(),
+        let reviews = s.spawn(|| match viewer() {
+            Ok((me, teams)) => review_queue(&review_repos, &me, &teams).unwrap_or_default(),
             Err(_) => Vec::new(),
         });
         let chunks: Vec<Result<Vec<CachedPr>>> = chunks
@@ -233,12 +264,13 @@ pub fn refresh(owner: &str, name: &str, branches: &[String]) -> Result<Cache> {
         prs,
         reviews,
     };
-    save_cache(owner, name, &cache)?;
+    save_cache(&cache)?;
     Ok(cache)
 }
 
 /// One multi-branch query: the PR, if any, for each branch in `chunk`.
-fn pr_chunk(owner: &str, name: &str, chunk: &[String]) -> Result<Vec<CachedPr>> {
+fn pr_chunk(repo: &str, remote: &GitHub, chunk: &[String]) -> Result<Vec<CachedPr>> {
+    let (owner, name) = (remote.owner.as_str(), remote.name.as_str());
     let (query, vars) = list_query(chunk);
     let mut args: Vec<String> = vec![
         "api".into(),
@@ -259,11 +291,11 @@ fn pr_chunk(owner: &str, name: &str, chunk: &[String]) -> Result<Vec<CachedPr>> 
     let body = gh(&args)?;
     let v: serde_json::Value =
         serde_json::from_slice(&body).context("parsing the graphql response")?;
-    let repo = &v["data"]["repository"];
+    let data = &v["data"]["repository"];
 
     let mut prs = Vec::new();
     for (i, branch) in chunk.iter().enumerate() {
-        let nodes = repo[format!("a{}", i + 1)]["nodes"]
+        let nodes = data[format!("a{}", i + 1)]["nodes"]
             .as_array()
             .cloned()
             .unwrap_or_default();
@@ -285,6 +317,7 @@ fn pr_chunk(owner: &str, name: &str, chunk: &[String]) -> Result<Vec<CachedPr>> 
         let rollup = &node["headRef"]["target"]["statusCheckRollup"];
 
         prs.push(CachedPr {
+            repo: repo.to_string(),
             branch: branch.clone(),
             number: node["number"].as_u64().unwrap_or(0) as u32,
             state: if is_draft && state == "OPEN" {
@@ -306,7 +339,8 @@ fn pr_chunk(owner: &str, name: &str, chunk: &[String]) -> Result<Vec<CachedPr>> 
 }
 
 /// Reviewers GitHub suggests for a PR, plus anyone already requested.
-pub fn suggested_reviewers(owner: &str, name: &str, number: u32) -> Result<Vec<String>> {
+pub fn suggested_reviewers(repo: &str, number: u32) -> Result<Vec<String>> {
+    let remote = github_of(repo)?;
     let q = r#"
 query($o: String!, $n: String!, $p: Int!) {
   repository(owner: $o, name: $n) {
@@ -325,9 +359,9 @@ query($o: String!, $n: String!, $p: Int!) {
         "-f".into(),
         format!("query={q}"),
         "-F".into(),
-        format!("o={owner}"),
+        format!("o={}", remote.owner),
         "-F".into(),
-        format!("n={name}"),
+        format!("n={}", remote.name),
         "-F".into(),
         format!("p={number}"),
     ])?;
@@ -416,6 +450,7 @@ query($q1: String!, $q2: String!, $q3: String!, $me: String!) {
 }
 fragment pr on PullRequest {
   number title url isDraft state headRefName
+  repository { name owner { login } }
   author { login }
   commits(last: 1) { nodes { commit {
     committedDate
@@ -454,18 +489,36 @@ fn iso_to_unix(s: &str) -> i64 {
     days * 86400 + hh * 3600 + mm * 60 + ss
 }
 
-/// Fetch the review queue. `teams` are org/team slugs you belong to.
+/// Fetch the review queue across `repos`, each a clone name and its GitHub
+/// repo. `teams` are org/team slugs you belong to.
 pub fn review_queue(
-    owner: &str,
-    name: &str,
+    repos: &[(String, GitHub)],
     me: &str,
     teams: &[String],
 ) -> Result<Vec<CachedReview>> {
-    let repo = format!("repo:{owner}/{name} is:pr is:open");
+    let Some((_, first)) = repos.first() else {
+        return Ok(Vec::new());
+    };
+    let repo = format!(
+        "{} is:pr is:open",
+        repos
+            .iter()
+            .map(|(_, gh)| format!("repo:{}", gh.slug()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let teams: Vec<&String> = teams
+        .iter()
+        .filter(|t| {
+            repos
+                .iter()
+                .any(|(_, gh)| t.starts_with(&format!("{}/", gh.owner)))
+        })
+        .collect();
     let team_clause = if teams.is_empty() {
         // A query that cannot match, rather than one with no filter at all: an
         // empty clause would return every open PR in the repo as a review.
-        format!("{repo} team-review-requested:{owner}/__none__")
+        format!("{repo} team-review-requested:{}/__none__", first.owner)
     } else {
         format!(
             "{repo} {}",
@@ -503,7 +556,17 @@ pub fn review_queue(
             .unwrap_or_default()
         {
             let number = n["number"].as_u64().unwrap_or(0) as u32;
-            if number == 0 || out.iter().any(|r| r.number == number) {
+            let (owner, name) = (
+                n["repository"]["owner"]["login"].as_str().unwrap_or(""),
+                n["repository"]["name"].as_str().unwrap_or(""),
+            );
+            let Some((repo, _)) = repos
+                .iter()
+                .find(|(_, gh)| gh.owner == owner && gh.name == name)
+            else {
+                continue;
+            };
+            if number == 0 || out.iter().any(|r| r.number == number && r.repo == *repo) {
                 continue;
             }
             let commit = &n["commits"]["nodes"][0]["commit"];
@@ -526,6 +589,7 @@ pub fn review_queue(
             let rollup = &commit["statusCheckRollup"];
             let is_draft = n["isDraft"].as_bool().unwrap_or(false);
             out.push(CachedReview {
+                repo: repo.clone(),
                 number,
                 title: n["title"].as_str().unwrap_or("").to_string(),
                 url: n["url"].as_str().unwrap_or("").to_string(),
@@ -552,9 +616,9 @@ const VIEWER_TTL: u64 = 3600;
 
 static VIEWER: Mutex<Option<(u64, String, Vec<String>)>> = Mutex::new(None);
 
-/// Your login, and the teams you belong to within `owner`. Memoized for an
-/// hour; a failure is not remembered, so the next fetch asks again.
-pub fn viewer(owner: &str) -> Result<(String, Vec<String>)> {
+/// Your login, and every `org/team` you belong to. Memoized for an hour; a
+/// failure is not remembered, so the next fetch asks again.
+pub fn viewer() -> Result<(String, Vec<String>)> {
     if let Ok(memo) = VIEWER.lock() {
         if let Some((at, me, teams)) = memo.as_ref() {
             if now().saturating_sub(*at) < VIEWER_TTL {
@@ -562,14 +626,14 @@ pub fn viewer(owner: &str) -> Result<(String, Vec<String>)> {
             }
         }
     }
-    let (me, teams) = fetch_viewer(owner)?;
+    let (me, teams) = fetch_viewer()?;
     if let Ok(mut memo) = VIEWER.lock() {
         *memo = Some((now(), me.clone(), teams.clone()));
     }
     Ok((me, teams))
 }
 
-fn fetch_viewer(owner: &str) -> Result<(String, Vec<String>)> {
+fn fetch_viewer() -> Result<(String, Vec<String>)> {
     let me = String::from_utf8_lossy(&gh(&[
         "api".into(),
         "user".into(),
@@ -590,7 +654,6 @@ fn fetch_viewer(owner: &str) -> Result<(String, Vec<String>)> {
     .map(|o| {
         String::from_utf8_lossy(&o)
             .lines()
-            .filter(|l| l.starts_with(&format!("{owner}/")))
             .map(str::to_string)
             .collect()
     })
@@ -601,16 +664,17 @@ fn fetch_viewer(owner: &str) -> Result<(String, Vec<String>)> {
 
 /// Every check context for a PR, with its url. One request, for one PR, on
 /// demand.
-pub fn contexts(owner: &str, name: &str, number: u32) -> Result<Vec<Check>> {
+pub fn contexts(repo: &str, number: u32) -> Result<Vec<Check>> {
+    let remote = github_of(repo)?;
     let args: Vec<String> = vec![
         "api".into(),
         "graphql".into(),
         "-f".into(),
         format!("query={CONTEXTS_QUERY}"),
         "-F".into(),
-        format!("owner={owner}"),
+        format!("owner={}", remote.owner),
         "-F".into(),
-        format!("name={name}"),
+        format!("name={}", remote.name),
         "-F".into(),
         format!("number={number}"),
     ];
@@ -657,6 +721,7 @@ pub fn to_reviews(cache: &Cache) -> Vec<Review> {
         .reviews
         .iter()
         .map(|r| Review {
+            repo: r.repo.clone(),
             number: r.number,
             title: r.title.clone(),
             url: r.url.clone(),
@@ -682,14 +747,17 @@ pub fn to_reviews(cache: &Cache) -> Vec<Review> {
 
 /// Fold a cache into the workstreams whose branch matches.
 pub fn apply(projects: &mut [Project], cache: &Cache) {
-    let by_branch: HashMap<&str, &CachedPr> =
-        cache.prs.iter().map(|p| (p.branch.as_str(), p)).collect();
+    let by_branch: HashMap<(&str, &str), &CachedPr> = cache
+        .prs
+        .iter()
+        .map(|p| ((p.repo.as_str(), p.branch.as_str()), p))
+        .collect();
 
     for p in projects.iter_mut() {
         for w in p.workstreams.iter_mut() {
             // Match on the remote name: local branches drop the handle, and
             // `headRefName` is always what the remote calls it.
-            let Some(c) = by_branch.get(w.git.remote_branch.as_str()) else {
+            let Some(c) = by_branch.get(&(w.repo.as_str(), w.git.remote_branch.as_str())) else {
                 continue;
             };
             w.pr = Some(PrInfo {
