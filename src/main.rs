@@ -960,11 +960,7 @@ fn create_project(app: &mut App) -> bool {
     )
 }
 
-/// Ask before moving a project to ARCHIVE.
-///
-/// A project with worktrees on disk is not offered: a worktree moved out from
-/// under the root is one the dashboard cannot see but git still lists, which is
-/// the exact blind spot this tool exists to close. `proj rm` them first.
+/// Ask before moving a project, worktrees and all, to ARCHIVE.
 fn confirm_archive(app: &mut App) {
     if app.sidebar == app::Sidebar::Reviews {
         app.flash("switch to projects with [ to archive one");
@@ -979,17 +975,16 @@ fn confirm_archive(app: &mut App) {
         return;
     }
     let on_disk = p.workstreams.iter().filter(|w| !w.is_virtual()).count();
-    if on_disk > 0 {
-        app.flash(format!("remove its {on_disk} workstream(s) first (d)"));
-        return;
-    }
-    let virtual_rows = p.workstreams.len();
+    let virtual_rows = p.workstreams.len() - on_disk;
     let (slug, name) = (p.slug.clone(), p.name.clone());
 
     let mut body = vec![
         format!("{} {name}", p.emoji),
         format!("moves to ~/projects/ARCHIVE/{slug}"),
     ];
+    if on_disk > 0 {
+        body.push(format!("{on_disk} worktree(s) move with it"));
+    }
     if virtual_rows > 0 {
         body.push(format!(
             "{virtual_rows} branch(es) without a worktree will show as unfiled"
@@ -1612,12 +1607,13 @@ mod new_project_tests {
     }
 
     #[test]
-    fn a_project_with_a_worktree_is_not_offered() {
+    fn a_project_with_a_worktree_is_offered_and_says_it_moves() {
         let mut a = app();
         a.projects = vec![project("react-19", vec![ws(Some("/tmp/react-19/hooks"))])];
         handle_key(&mut a, key('A'));
-        assert!(a.confirm.is_none());
-        assert!(a.flash.is_some());
+        let c = a.confirm.as_ref().expect("a confirmation");
+        assert!(c.body.iter().any(|l| l.contains("1 worktree(s) move with it")));
+        assert!(!c.body.iter().any(|l| l.contains("unfiled")));
     }
 }
 

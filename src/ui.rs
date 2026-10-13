@@ -1138,7 +1138,7 @@ fn draw_help(f: &mut Frame) {
         Line::from("  b               rebase on main, then rebuild"),
         Line::from("  p / P           push / force-push with lease"),
         Line::from("  d               delete it, after confirming — a virtual row's branch, local and remote"),
-        Line::from("  A               archive the project to ~/projects/ARCHIVE, once it has no worktrees"),
+        Line::from("  A               archive the project, worktrees and all, to ~/projects/ARCHIVE"),
         Line::from(""),
         Line::from(Span::styled("  in the review queue", Style::default().bold())),
         Line::from("  ↵               check the PR out under review/ and build it, or cd there"),

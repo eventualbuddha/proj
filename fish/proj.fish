@@ -89,8 +89,7 @@ function __proj_help
     echo "                                          first, prompting for its README frontmatter"
     echo "  new <project>                           Create just the project"
     echo "  archive [<project>]                     Move a project to ~/projects/ARCHIVE (defaults"
-    echo "                                          to the one you are standing in)"
-    echo "                                          Refuses while it still has worktrees"
+    echo "                                          to the one you are standing in), worktrees and all"
     echo "  rm|remove [<project>/<workstream>]      Remove a workstream (defaults to the current one)"
     echo "                                          Fails on uncommitted changes, or on commits that are"
     echo "                                          neither in main (by patch-id, so squash merges count)"
@@ -933,21 +932,6 @@ function __proj_archive --description "Move a project to ARCHIVE"
         return 1
     end
 
-    # A worktree moved out of the root is one the dashboard cannot see but git
-    # still lists, and its branch would come back as a virtual row offering to
-    # create a worktree that already exists. Removing them first is the way.
-    set -l worktrees (__proj_workstreams "$project")
-    if test (count $worktrees) -gt 0
-        echo "proj archive: '$project' still has worktrees:" >&2
-        for entry in $worktrees
-            set -l parts (string split \t -- "$entry")
-            echo "  $parts[1]/$parts[2]" >&2
-        end
-        echo "" >&2
-        echo "Remove them first with: proj rm <project>/<workstream>" >&2
-        return 1
-    end
-
     set -l to "$root/ARCHIVE/$project"
     if test -e "$to"
         echo "proj archive: $to already exists" >&2
@@ -966,6 +950,16 @@ function __proj_archive --description "Move a project to ARCHIVE"
     or begin
         echo "proj archive: failed to move $from" >&2
         return 1
+    end
+
+    # The worktrees move with the project; point git at their new home.
+    set -l moved
+    for dir in $to/*/
+        test -e "$dir/.git"; and set -a moved (string trim -r -c / -- "$dir")
+    end
+    if test (count $moved) -gt 0
+        git -C (__proj_repo) worktree repair $moved &>/dev/null
+        or echo "proj archive: git worktree repair failed; run it by hand" >&2
     end
 
     echo "Archived '$project' to $to"
