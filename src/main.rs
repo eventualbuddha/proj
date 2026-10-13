@@ -2246,6 +2246,13 @@ mod github_menu_tests {
 
     #[test]
     fn a_workstream_with_no_pr_offers_the_compare_url() {
+        repo::remember(
+            "vxsuite",
+            repo::GitHub {
+                owner: "votingworks".into(),
+                name: "vxsuite".into(),
+            },
+        );
         let items = CopyMenu::github_for(&ws(None));
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "open a PR");

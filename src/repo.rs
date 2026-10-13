@@ -50,6 +50,15 @@ pub fn github(repo: &str) -> Option<GitHub> {
     found
 }
 
+#[cfg(test)]
+pub fn remember(repo: &str, gh: GitHub) {
+    GITHUB
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(repo.to_string(), Some(gh));
+}
+
 /// `owner/name` from an https, ssh or scp-style GitHub url.
 fn parse_github_url(url: &str) -> Option<GitHub> {
     let url = url.trim();
