@@ -7,11 +7,10 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
-use crate::model::{GitState, Merged, Op, OpKind};
+use crate::model::{GitState, Op, OpKind};
 
 pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
@@ -180,24 +179,6 @@ pub fn worktrees(repo: &Path) -> Result<HashMap<String, PathBuf>> {
     Ok(map)
 }
 
-/// Local branches with their tip sha, so orphans can be found by set difference
-/// against `worktrees()`.
-pub fn local_branches(repo: &Path) -> Result<Vec<(String, String)>> {
-    let out = run(
-        repo,
-        &[
-            "for-each-ref",
-            "--format=%(refname:short)%09%(objectname)",
-            "refs/heads",
-        ],
-    )?;
-    Ok(out
-        .lines()
-        .filter_map(|l| l.split_once('\t'))
-        .map(|(a, b)| (a.to_string(), b.to_string()))
-        .collect())
-}
-
 /// Read everything about one branch. `dir` is the worktree for a materialized
 /// row; for a virtual one it is the main repo and only branch-level facts (which
 /// need no checkout) are filled in.
@@ -240,22 +221,77 @@ pub fn state(dir: &Path, branch: &str, base: &str, materialized: bool) -> GitSta
 
     // Working-tree facts exist only where there is a working tree.
     if materialized {
-        if let Some(porcelain) = ok(dir, &["status", "--porcelain"]) {
-            for line in porcelain.lines() {
-                if line.len() >= 2 {
-                    let b = line.as_bytes();
-                    if b[0] != b' ' && b[0] != b'?' {
-                        st.staged += 1;
-                    }
-                    if b[1] != b' ' || b[0] == b'?' {
-                        st.dirty += 1;
-                    }
-                }
-            }
-        }
+        add_status(dir, &mut st);
     }
 
     st
+}
+
+/// Fill in the staged and dirty counts of the worktree at `dir`.
+pub fn add_status(dir: &Path, st: &mut GitState) {
+    let Some(porcelain) = ok(dir, &["status", "--porcelain"]) else {
+        return;
+    };
+    for line in porcelain.lines() {
+        if line.len() >= 2 {
+            let b = line.as_bytes();
+            if b[0] != b' ' && b[0] != b'?' {
+                st.staged += 1;
+            }
+            if b[1] != b' ' || b[0] == b'?' {
+                st.dirty += 1;
+            }
+        }
+    }
+}
+
+/// The branch-level half of `state` for every local branch, from one
+/// `for-each-ref`. Working-tree counts are left at zero.
+pub fn branch_states(repo: &Path, base: &str) -> HashMap<String, GitState> {
+    let format = format!(
+        "--format=%(refname:short)%09%(objectname:short)%09%(ahead-behind:{base})%09\
+         %(committerdate:unix)%09%(upstream:short)%09%(upstream:remoteref)%09\
+         %(upstream:track,nobracket)"
+    );
+    let Some(out) = ok(repo, &["for-each-ref", &format, "refs/heads"]) else {
+        return HashMap::new();
+    };
+    out.lines().filter_map(parse_branch_state).collect()
+}
+
+fn parse_branch_state(line: &str) -> Option<(String, GitState)> {
+    // `run` trims the output, which takes the last line's empty trailing fields.
+    let mut f = line.split('\t');
+    let [branch, head, ahead_behind, date, upstream, merge, track] =
+        std::array::from_fn(|_| f.next().unwrap_or(""));
+    let nonempty = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    let (ahead, behind) = ahead_behind.split_once(' ')?;
+    // A tracking ref the remote has pruned is no upstream at all, as
+    // `@{upstream}` would say.
+    let upstream = nonempty(upstream).filter(|_| track != "gone");
+    let unpushed = upstream.as_ref().map(|_| {
+        track
+            .split(", ")
+            .find_map(|t| t.strip_prefix("ahead "))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    });
+    let configured = nonempty(merge);
+    Some((
+        branch.to_string(),
+        GitState {
+            branch: branch.to_string(),
+            head: head.to_string(),
+            ahead: ahead.parse().ok()?,
+            behind: behind.parse().ok()?,
+            last_commit: date.parse().ok(),
+            pushed: configured.is_some(),
+            remote_branch: remote_name(branch, upstream.as_deref(), configured.as_deref()),
+            upstream,
+            unpushed,
+            ..Default::default()
+        },
+    ))
 }
 
 /// Bring remote-tracking refs up to date and drop the ones whose branches are
@@ -288,196 +324,6 @@ pub fn remote_name(branch: &str, upstream: Option<&str>, configured: Option<&str
     branch.to_string()
 }
 
-/// Answer the merged question four ways, cheapest and most trustworthy first.
-///
-/// Patch-ids are what matter in this repo, since a squash merge rewrites the
-/// history and ancestry then says no about every merged branch. `git cherry`
-/// asks that question one commit at a time, which only settles a branch that
-/// squashed down to a single commit; `squashed_into` asks it of the branch's
-/// whole diff, which is what a squash of several commits actually becomes.
-///
-/// A merged PR is reported as merged only when nothing local contradicts it. It
-/// is the *PR* that merged, not the branch: commits pushed after the merge, or
-/// never pushed at all, sit on the branch with no equivalent in main, and
-/// calling that "merged" is how a delete confirmation ends up vouching for work
-/// that only exists here.
-pub fn merged(dir: &Path, branch: &str, base: &str, pr_merged: bool) -> Merged {
-    let arg = base.to_string();
-    if run(dir, &["merge-base", "--is-ancestor", branch, &arg]).is_ok() {
-        return if pr_merged {
-            Merged::Pr
-        } else {
-            Merged::Ancestor
-        };
-    }
-
-    if let Some(out) = ok(dir, &["cherry", base, branch]) {
-        let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
-        // `+` means no equivalent *commit* upstream. On its own that is not an
-        // answer -- a branch squashed into one commit has a `+` against every
-        // commit it was built from -- so the whole-branch patch gets a say
-        // before this reports anything as unmerged.
-        if !lines.is_empty() {
-            if !lines.iter().any(|l| l.starts_with('+')) {
-                // Every commit has an equivalent in main. A rebase-and-merge
-                // looks exactly like this, and so does a one-commit squash.
-                return if pr_merged {
-                    Merged::Pr
-                } else {
-                    Merged::Equivalent
-                };
-            }
-            if !squashed_into(dir, branch, base) {
-                return Merged::No;
-            }
-            return if pr_merged {
-                Merged::Pr
-            } else {
-                Merged::Equivalent
-            };
-        }
-    }
-
-    // No local answer -- `cherry` failed, or the branch is unreadable from here.
-    // GitHub's is the only one left.
-    if pr_merged {
-        Merged::Pr
-    } else {
-        Merged::No
-    }
-}
-
-/// Run `git <args>` and pipe its output through `git patch-id --stable`,
-/// returning the lines it prints: `<patch-id> <commit-id>`, one per patch.
-fn patch_ids(dir: &Path, args: &[&str]) -> Option<String> {
-    let diff = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .ok()?;
-    if !diff.status.success() || diff.stdout.is_empty() {
-        return None;
-    }
-
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["patch-id", "--stable"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    // A writer thread, because the output is one line per commit and enough
-    // commits would fill the stdout pipe while we are still writing stdin.
-    let mut stdin = child.stdin.take()?;
-    let input = diff.stdout;
-    let writer = std::thread::spawn(move || stdin.write_all(&input));
-    let out = child.wait_with_output().ok()?;
-    let _ = writer.join();
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// The patch-id of a diff produced by `git <args>`.
-fn patch_id(dir: &Path, args: &[&str]) -> Option<String> {
-    let text = patch_ids(dir, args)?;
-    let id = text.split_whitespace().next()?;
-    (!id.is_empty()).then(|| id.to_string())
-}
-
-/// The files each commit touched, as `(sha, files)`, in one `diff-tree`.
-fn files_touched(dir: &Path, shas: &[&str]) -> Vec<(String, Vec<String>)> {
-    let Ok(mut child) = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["diff-tree", "--stdin", "-r", "-M", "--name-only"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return Vec::new();
-    };
-    let Some(mut stdin) = child.stdin.take() else {
-        return Vec::new();
-    };
-    let input = shas.iter().map(|s| format!("{s}\n")).collect::<String>();
-    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
-    let Ok(out) = child.wait_with_output() else {
-        return Vec::new();
-    };
-    let _ = writer.join();
-
-    // One block per commit: the sha, its files, a blank line.
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut result = Vec::new();
-    for block in text.split("\n\n") {
-        let mut lines = block.lines().filter(|l| !l.is_empty());
-        let Some(sha) = lines.next() else { continue };
-        result.push((sha.to_string(), lines.map(str::to_string).collect()));
-    }
-    result
-}
-
-/// Whether the branch landed on `base` as a single squashed commit.
-///
-/// `git cherry` compares one commit at a time, so a squash of more than one
-/// commit defeats it: none of the branch's commits has an equivalent patch
-/// upstream, only their sum does. That sum is what this looks for -- the
-/// patch-id of the branch's whole diff, against the commits on `base` that
-/// touched the same files.
-fn squashed_into(dir: &Path, branch: &str, base: &str) -> bool {
-    let Some(mb) = ok(dir, &["merge-base", base, branch]) else {
-        return false;
-    };
-    let Some(want) = patch_id(dir, &["diff", &mb, branch]) else {
-        return false;
-    };
-
-    // Only a commit that touched the same files can carry the same patch, and
-    // on a busy `main` that is the difference between a handful of candidates
-    // and every commit since the branch started.
-    let files = ok(dir, &["diff", "--name-only", "-M", &mb, branch]).unwrap_or_default();
-    let mut want_files: Vec<&str> = files.lines().collect();
-    want_files.sort_unstable();
-    let range = format!("{mb}..{base}");
-    let mut args = vec!["rev-list", &range, "--"];
-    args.extend(want_files.iter().copied());
-    let Some(candidates) = ok(dir, &args) else {
-        return false;
-    };
-
-    // A patch-id covers the file names too, so a commit that touched anything
-    // beyond the branch's files cannot match and is not worth diffing. This
-    // is what keeps a thousand-file lockfile bump on `main` from being hashed
-    // once per row that touched the lockfile.
-    let shas: Vec<&str> = candidates.lines().collect();
-    let same_files: Vec<String> = files_touched(dir, &shas)
-        .into_iter()
-        .filter_map(|(sha, mut touched)| {
-            touched.sort_unstable();
-            let same = touched
-                .iter()
-                .map(String::as_str)
-                .eq(want_files.iter().copied());
-            same.then_some(sha)
-        })
-        .collect();
-    if same_files.is_empty() {
-        return false;
-    }
-
-    // One `show` of every survivor, so `patch-id` answers for all of them in
-    // a single pass. The `commit` header line is what it splits on.
-    let mut args = vec!["show", "--format=commit %H"];
-    args.extend(same_files.iter().map(String::as_str));
-    patch_ids(dir, &args)
-        .unwrap_or_default()
-        .lines()
-        .any(|l| l.split_whitespace().next() == Some(want.as_str()))
-}
-
 /// Run `f` over every item on its own thread and return the results in order.
 ///
 /// Everything here is a `git` child process waiting on disk, so the rows are
@@ -504,29 +350,12 @@ where
 
 /// Commits on `dir`'s HEAD that exist neither on `base` nor on a remote.
 ///
-/// This is the question `proj rm` refuses on, so it lives here rather than in
-/// the shell: the confirmation the TUI shows and the check that enforces it
-/// have to be the same answer, and two implementations of patch-id matching
-/// were two chances to disagree.
+/// This is what `proj rm` refuses on, so it lives here rather than in the
+/// shell, next to the counts the delete confirmation shows.
 pub fn stranded(dir: &Path, base: &str) -> Vec<String> {
-    // A squash merge of more than one commit lands under a sha of its own, and
-    // `git cherry` -- one commit at a time -- calls every commit it was built
-    // from stranded. The branch's whole diff is the thing that merged.
-    if squashed_into(dir, "HEAD", base) {
-        return Vec::new();
-    }
-
-    let Some(out) = ok(dir, &["cherry", base, "HEAD"]) else {
-        return Vec::new();
-    };
-
-    out.lines()
-        .filter_map(|l| l.strip_prefix("+ "))
-        // Still reachable from the remote-tracking ref, so removing the
-        // worktree loses nothing.
-        .filter(|sha| run(dir, &["merge-base", "--is-ancestor", sha, "@{upstream}"]).is_err())
-        .map(str::to_string)
-        .collect()
+    ok(dir, &["rev-list", "HEAD", "--not", base, "--remotes"])
+        .map(|out| out.lines().map(str::to_string).collect())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -534,7 +363,7 @@ mod tests {
     use super::*;
 
     /// A scratch repo, since the whole point of these is what real `git`
-    /// does with patch-ids -- a fake would be testing the fake.
+    /// does -- a fake would be testing the fake.
     struct Scratch(PathBuf);
 
     impl Drop for Scratch {
@@ -567,64 +396,22 @@ mod tests {
         }
     }
 
-    /// The case that could not be deleted: five commits, squashed into one.
-    /// Every one of them is a `+` to `git cherry`, and none of them is at risk.
     #[test]
-    fn a_squash_of_several_commits_is_merged_and_strands_nothing() {
-        let s = Scratch::new("squash");
-        s.git(&["checkout", "--quiet", "-b", "feature"]);
-        for i in 0..5 {
-            s.commit(&format!("f{i}"), &format!("{i}\n"));
-        }
-
-        s.git(&["checkout", "--quiet", "main"]);
-        s.git(&["merge", "--quiet", "--squash", "feature"]);
-        s.git(&["commit", "--quiet", "-m", "the whole feature (#1)"]);
-
-        assert!(
-            squashed_into(&s.0, "feature", "main"),
-            "the branch's whole diff is in main"
-        );
-        assert_eq!(merged(&s.0, "feature", "main", false), Merged::Equivalent);
-        assert_eq!(merged(&s.0, "feature", "main", true), Merged::Pr);
-
-        s.git(&["checkout", "--quiet", "feature"]);
-        assert!(stranded(&s.0, "main").is_empty(), "nothing is only here");
-    }
-
-    /// The check that must not soften: work that really does live nowhere else.
-    #[test]
-    fn a_commit_that_landed_nowhere_is_still_stranded() {
+    fn a_commit_that_landed_nowhere_is_stranded() {
         let s = Scratch::new("unmerged");
         s.git(&["checkout", "--quiet", "-b", "feature"]);
         s.commit("mine", "mine\n");
-
-        assert!(!squashed_into(&s.0, "feature", "main"));
-        assert_eq!(merged(&s.0, "feature", "main", false), Merged::No);
-        // Even GitHub saying the PR merged cannot vouch for this one.
-        assert_eq!(merged(&s.0, "feature", "main", true), Merged::No);
         assert_eq!(stranded(&s.0, "main").len(), 1);
     }
 
-    /// A commit pushed after the squash landed. The branch is half in main, and
-    /// the half that is not is exactly what a delete would lose.
     #[test]
-    fn a_commit_added_after_the_squash_is_stranded() {
-        let s = Scratch::new("after");
+    fn a_commit_on_a_remote_is_not_stranded() {
+        let s = Scratch::new("pushed");
         s.git(&["checkout", "--quiet", "-b", "feature"]);
-        s.commit("f0", "0\n");
-        s.commit("f1", "1\n");
-
-        s.git(&["checkout", "--quiet", "main"]);
-        s.git(&["merge", "--quiet", "--squash", "feature"]);
-        s.git(&["commit", "--quiet", "-m", "the feature (#1)"]);
-
-        s.git(&["checkout", "--quiet", "feature"]);
-        s.commit("f2", "2\n");
-
-        assert!(!squashed_into(&s.0, "feature", "main"));
-        assert_eq!(merged(&s.0, "feature", "main", true), Merged::No);
-        assert_eq!(stranded(&s.0, "main").len(), 3);
+        s.commit("mine", "mine\n");
+        s.git(&["update-ref", "refs/remotes/origin/feature", "HEAD"]);
+        s.commit("more", "more\n");
+        assert_eq!(stranded(&s.0, "main").len(), 1);
     }
 
     #[test]
@@ -650,5 +437,45 @@ mod tests {
         assert_eq!(remote_name("brian/p/w", None, None), "brian/p/w");
         // A config entry that is not a branch ref says nothing useful.
         assert_eq!(remote_name("p/w", None, Some("refs/heads/")), "p/w");
+    }
+
+    #[test]
+    fn branch_states_match_the_per_branch_answers() {
+        let r = Scratch::new("branch-states");
+        r.git(&["checkout", "-q", "-b", "feat"]);
+        r.commit("b", "2");
+        r.commit("c", "3");
+        let st = &branch_states(&r.0, "main")["feat"];
+        let one = state(&r.0, "feat", "main", false);
+        assert_eq!((st.ahead, st.behind, &st.head), (2, 0, &one.head));
+        assert_eq!((st.ahead, st.behind), (one.ahead, one.behind));
+        assert_eq!((&st.upstream, st.unpushed), (&None, None));
+        assert_eq!(st.last_commit, one.last_commit);
+    }
+
+    #[test]
+    fn a_pruned_upstream_is_no_upstream_but_still_names_the_remote_branch() {
+        let (_, st) =
+            parse_branch_state("p/w\tabc\t1 2\t5\torigin/brian/p/w\trefs/heads/brian/p/w\tgone")
+                .unwrap();
+        assert_eq!((st.upstream, st.unpushed, st.pushed), (None, None, true));
+        assert_eq!(st.remote_branch, "brian/p/w");
+    }
+
+    #[test]
+    fn trailing_empty_fields_may_be_missing() {
+        let (_, st) = parse_branch_state("p/w\tabc\t3 4\t5").unwrap();
+        assert_eq!(
+            (st.ahead, st.behind, st.upstream, st.pushed),
+            (3, 4, None, false)
+        );
+    }
+
+    #[test]
+    fn unpushed_is_the_ahead_count_against_the_upstream() {
+        let line = "p/w\tabc\t1 2\t5\torigin/p/w\trefs/heads/p/w\tahead 3, behind 1";
+        assert_eq!(parse_branch_state(line).unwrap().1.unpushed, Some(3));
+        let line = "p/w\tabc\t1 2\t5\torigin/p/w\trefs/heads/p/w\t";
+        assert_eq!(parse_branch_state(line).unwrap().1.unpushed, Some(0));
     }
 }

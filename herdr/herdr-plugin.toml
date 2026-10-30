@@ -1,0 +1,37 @@
+id = "proj"
+name = "proj"
+version = "0.1.0"
+min_herdr_version = "0.9.4"
+description = "Label, annotate and order workspaces by ~/projects project and workstream"
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["proj-tui", "--herdr-sync"]
+
+[[events]]
+on = "workspace.created"
+command = ["proj-tui", "--herdr-sync"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["proj-tui", "--herdr-sync"]
+
+[[actions]]
+id = "dashboard"
+title = "proj: dashboard"
+contexts = ["workspace"]
+command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin proj --entrypoint dashboard"]
+
+[[actions]]
+id = "sync"
+title = "proj: sync sidebar"
+contexts = ["workspace"]
+command = ["proj-tui", "--herdr-sync"]
+
+[[panes]]
+id = "dashboard"
+title = "proj"
+placement = "popup"
+width = "90%"
+height = "90%"
+command = ["fish", "-c", "proj"]

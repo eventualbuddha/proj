@@ -18,8 +18,8 @@ rustPlatform.buildRustPackage {
   # the daemon it starts from this same binary, which is the process that
   # actually runs them.
   nativeBuildInputs = [ makeWrapper ];
-  # The merged-ness tests build scratch repos, because what they are checking
-  # is what real `git` does with patch-ids.
+  # The git tests build scratch repos, because what they are checking is what
+  # real `git` does.
   nativeCheckInputs = [ git ];
   postInstall = ''
     wrapProgram $out/bin/proj-tui \

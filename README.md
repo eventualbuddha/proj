@@ -21,6 +21,7 @@ from that clone's `origin`.
 | `fish/completions/proj.fish` | Completions, fed by `proj __projects` / `__workstreams` / `__branches`. |
 | `fish/conf.d/30-proj-cargo.fish` | Per-project `CARGO_TARGET_DIR`, driven off `PWD`. |
 | `bin/proj-prompt.sh` | The starship segment, as a plain `sh` script. |
+| `herdr/herdr-plugin.toml` | The herdr plugin: labels, annotates and orders workspaces by project, and opens the dashboard as a popup. |
 
 The TUI is installed as `proj-tui`, not `proj`: `proj` is the fish function that
 wraps it, because a process cannot change its parent shell's directory and the
@@ -48,6 +49,22 @@ The module installs both binaries, the fish function, the completions and the
 `conf.d` snippet, and defines a `custom.proj` starship segment. Putting that
 segment in the prompt is still the host's job: splice `${custom.proj}` into
 starship's `format`.
+
+## herdr
+
+With `programs.proj.herdr.enable = true`, activation writes the plugin manifest
+to `~/.config/proj/herdr-plugin`. Link it once:
+
+```sh
+herdr plugin link ~/.config/proj/herdr-plugin
+```
+
+The plugin syncs on herdr startup, when a workspace is created and when an agent
+is detected; a running dashboard also syncs after every scan and fetch. In the
+popup (`proj.dashboard` action), ↵ focuses or creates the workstream's workspace
+instead of changing directory. Workspace tokens `$pr`, `$checks`, `$review`,
+`$stack` and `$local`, and pane tokens `$project` and `$workstream`, are there
+to put in herdr's `[ui.sidebar.spaces]` and `[ui.sidebar.agents]` rows.
 
 ## Develop
 

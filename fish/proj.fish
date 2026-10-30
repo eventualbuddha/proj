@@ -94,9 +94,8 @@ function __proj_help
     echo "  archive [<project>]                     Move a project to ~/projects/ARCHIVE (defaults"
     echo "                                          to the one you are standing in), worktrees and all"
     echo "  rm|remove [<project>/<workstream>]      Remove a workstream (defaults to the current one)"
-    echo "                                          Fails on uncommitted changes, or on commits that are"
-    echo "                                          neither in main (by patch-id, so squash merges count)"
-    echo "                                          nor on a remote"
+    echo "                                          Fails on uncommitted changes, or, unless its PR merged,"
+    echo "                                          on commits that are neither in main nor on a remote"
     echo "                                          Also deletes the associated branch"
     echo "  cd [<project>[/<workstream>]]           cd to a project or workstream"
     echo "                                            cd              -> ~/projects"
@@ -717,6 +716,11 @@ function __proj_worktree_add --description "Add the worktree at PATH from the cl
 end
 
 function __proj_goto --description "cd to a path, remembering where we came from"
+    # In proj's herdr popup, going somewhere means that place's workspace.
+    if test "$HERDR_PLUGIN_ID" = proj
+        proj-tui --herdr-open "$argv[1]"
+        return $status
+    end
     set -g __proj_last_dir (pwd)
     cd "$argv[1]"
 end
@@ -1032,9 +1036,7 @@ function __proj_archive --description "Move a project to ARCHIVE"
 end
 
 function __proj_stranded_commits --description "Commits on WORKTREE's HEAD that exist neither in main nor on its remote"
-    # `proj-tui` owns this answer: the delete confirmation it draws and the
-    # refusal here have to agree, and patch-id matching is too easy to get
-    # subtly differently in two places.
+    # `proj-tui` owns this answer, since it knows whether the PR merged.
     proj-tui --stranded "$argv[1]" 2>/dev/null
 end
 
@@ -1100,8 +1102,8 @@ function __proj_remove
         # Commits that exist nowhere but here. A review checkout has none by
         # definition: every commit in it came from `refs/pull/<n>/head`, which
         # GitHub keeps for good, and none of them are yours. The check would
-        # otherwise refuse every one of these -- the branch has no upstream, so
-        # `git cherry` calls the whole PR stranded.
+        # otherwise refuse every one of these, since no remote-tracking ref
+        # reaches them.
         if test -n "$branch"; and test "$branch" != HEAD
             and test (__proj_meta "$project" kind) != review
             set -l stranded (__proj_stranded_commits "$wt_path")

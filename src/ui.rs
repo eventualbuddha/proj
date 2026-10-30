@@ -843,12 +843,6 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
                 Merged::No => String::new(),
                 Merged::Pr => "   merged (PR)".into(),
                 Merged::Ancestor => "   merged (ancestor of main)".into(),
-                // Spell this one out. "Squashed" is the difference between "the
-                // code is in main" and "GitHub says so", and a reader who does
-                // not know that will read it as a warning.
-                Merged::Equivalent => {
-                    "   squashed into main (same patches, rewritten history)".into()
-                }
             },
             Style::default().fg(Color::Magenta),
         ),
@@ -1158,10 +1152,6 @@ fn draw_help(f: &mut Frame) {
         Line::from(""),
         Line::from(Span::styled(
             "  A dimmed row is virtual: a branch with no worktree.",
-            Style::default().fg(DIM),
-        )),
-        Line::from(Span::styled(
-            "  \"squashed\" means the patches are in main, though history was rewritten.",
             Style::default().fg(DIM),
         )),
         Line::from(""),

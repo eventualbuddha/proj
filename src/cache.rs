@@ -139,7 +139,6 @@ pub fn load() -> Option<Vec<Project>> {
                         merged: match w.merged {
                             1 => Merged::Pr,
                             2 => Merged::Ancestor,
-                            3 => Merged::Equivalent,
                             _ => Merged::No,
                         },
                         pr: None,

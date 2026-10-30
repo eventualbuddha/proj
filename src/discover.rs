@@ -111,6 +111,15 @@ fn glob_match(pattern: &str, s: &str) -> bool {
 
 /// Scan the root, read git, and return every project with its rows.
 pub fn scan() -> Result<Vec<Project>> {
+    scan_where(&|_| true, true)
+}
+
+/// Only the worktrees `want` picks, and no virtual rows.
+pub fn scan_only(want: &(dyn Fn(&Path) -> bool + Sync)) -> Result<Vec<Project>> {
+    scan_where(want, false)
+}
+
+fn scan_where(want: &(dyn Fn(&Path) -> bool + Sync), virtual_rows: bool) -> Result<Vec<Project>> {
     let root = projects_root();
     let mut projects: Vec<Project> = Vec::new();
 
@@ -156,17 +165,22 @@ pub fn scan() -> Result<Vec<Project>> {
         .flat_map(|p| p.repos.iter().cloned())
         .filter(|r| repo::path(r).is_dir())
         .collect();
-    let bases: HashMap<String, String> = git::par_map(repos.iter().collect(), |r| {
-        (r.clone(), git::base_ref(&repo::path(r)))
-    })
-    .into_iter()
-    .collect();
+    let mut bases: HashMap<String, String> = HashMap::new();
+    let mut refs: HashMap<String, HashMap<String, GitState>> = HashMap::new();
+    for (r, base, states) in git::par_map(repos.iter().collect(), |r| {
+        let base = git::base_ref(&repo::path(r));
+        let states = git::branch_states(&repo::path(r), &base);
+        (r.clone(), base, states)
+    }) {
+        bases.insert(r.clone(), base);
+        refs.insert(r, states);
+    }
 
     for (project, dir) in projects.iter_mut().zip(&dirs) {
         // Materialized rows: directories under the project that are worktrees.
         let mut sub: Vec<_> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir() && e.path().join(".git").exists())
+            .filter(|e| e.path().is_dir() && e.path().join(".git").exists() && want(&e.path()))
             .collect();
         sub.sort_by_key(|e| e.file_name());
 
@@ -192,7 +206,14 @@ pub fn scan() -> Result<Vec<Project>> {
                 .or_else(|| git::run(&path, &["rev-parse", "--abbrev-ref", "HEAD"]).ok())
                 .unwrap_or_else(|| "HEAD".into());
 
-            let mut git_state = git::state(&path, &branch, &base, true);
+            let mut git_state = match refs.get(&repo).and_then(|m| m.get(&branch)) {
+                Some(st) => {
+                    let mut st = st.clone();
+                    git::add_status(&path, &mut st);
+                    st
+                }
+                None => git::state(&path, &branch, &base, true),
+            };
             git_state.op = op;
 
             Workstream {
@@ -211,23 +232,19 @@ pub fn scan() -> Result<Vec<Project>> {
     // project's prefix or globs match. This is the case that motivated the
     // split -- `brian/esm-lib-batch-4` is six commits and a draft PR with no
     // directory, and without this it renders nowhere.
-    let mut orphans: Vec<(String, String)> = Vec::new();
-    for r in &repos {
+    let mut orphans: Vec<(String, String, GitState)> = Vec::new();
+    for r in repos.iter().filter(|_| virtual_rows) {
         let clone = repo::path(r);
         let worktrees = git::worktrees(&clone).unwrap_or_default();
         let checked_out: HashSet<&String> = worktrees.keys().collect();
-        for (branch, _sha) in git::local_branches(&clone).unwrap_or_default() {
+        for (branch, st) in refs.get(r).into_iter().flatten() {
             // `main` is the base, not a workstream.
-            if !checked_out.contains(&branch) && branch != "main" {
-                orphans.push((r.clone(), branch));
+            if !checked_out.contains(branch) && branch != "main" {
+                orphans.push((r.clone(), branch.clone(), st.clone()));
             }
         }
     }
-    let states = git::par_map(orphans, |(r, branch)| {
-        let state = git::state(&repo::path(&r), &branch, &bases[&r], false);
-        (r, branch, state)
-    });
-    for (r, branch, git_state) in states {
+    for (r, branch, git_state) in orphans {
         // No project claims it -- but dropping it here is exactly the blindness
         // this tool exists to remove, so it goes to a synthetic "unfiled"
         // project instead. An unfiled row is a prompt: file it, or delete it.
