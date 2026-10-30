@@ -14,16 +14,14 @@ use ratatui::widgets::{ListState, TableState};
 
 use crate::client;
 use crate::discover;
-use crate::git;
 use crate::github::{self, RepoBranch};
 use crate::ipc::Req;
 use crate::model::*;
 use crate::repo;
 
 /// How often to re-read the filesystem and git. lazygit refreshes local state
-/// every 10s; this scan is heavier than the one lazygit does on that cadence
-/// (per-branch rev-list, status, and `git cherry` over every row), so it gets a
-/// slightly longer leash.
+/// every 10s; this scan covers every worktree and branch rather than one, so it
+/// gets a slightly longer leash.
 const SCAN_INTERVAL: u64 = 15;
 
 /// How often to `git fetch` and re-query GitHub. lazygit's fetchInterval, which
@@ -38,10 +36,6 @@ pub enum Msg {
     Scanned(Vec<Project>),
     Refreshed(Box<github::Cache>),
     RefreshFailed(String),
-    /// Merged-ness, keyed by repo and branch. Deliberately *not* a whole tree:
-    /// sending one back would clobber anything fetched lazily since the copy
-    /// was taken, and would re-enter the scan handler.
-    Merged(Vec<(RepoBranch, Merged)>),
     Contexts(String, u32, Vec<Check>),
     Reviewers(Vec<String>),
     /// The daemon connection came up. Until this lands -- and after
@@ -458,9 +452,6 @@ pub struct App {
     pub workstream_idx: usize,
     pub fetched_at: Option<u64>,
     pub refreshing: bool,
-    /// The merged-ness pass runs after the fetch, on a thread of its own, so a
-    /// fetched dashboard is not yet a finished one.
-    pub merging: bool,
     pub loading: bool,
     pub scanning: bool,
     pub scanned_at: u64,
@@ -515,9 +506,8 @@ pub struct App {
 impl App {
     /// Construct empty and start the scan in the background.
     ///
-    /// Everything here is cheap; the ~0.5s of `git worktree list`, per-branch
-    /// `rev-list`, `status --porcelain` and (mostly) `git cherry` happens on a
-    /// thread. The window is on screen before any of it runs, which is the
+    /// Everything here is cheap; the `for-each-ref`, `worktree list` and
+    /// `status --porcelain` calls happen on a thread. The window is on screen before any of it runs, which is the
     /// difference between a tool that opens and one you wait for.
     pub fn new() -> Result<Self> {
         let (tx, rx) = mpsc::channel();
@@ -530,7 +520,6 @@ impl App {
             project_idx: 0,
             workstream_idx: 0,
             fetched_at: None,
-            merging: false,
             refreshing: false,
             loading: true,
             scanning: false,
@@ -594,8 +583,7 @@ impl App {
     }
 
     /// Scan on a thread: filesystem, git, then whatever GitHub state is already
-    /// cached. Merged-ness follows in a pass of its own once this lands, since
-    /// it depends on whether a PR says merged.
+    /// cached.
     /// `show_loading` only on the first scan. A periodic one must not throw a
     /// modal over a screen you are reading.
     pub fn start_scan(&mut self, show_loading: bool) {
@@ -611,11 +599,7 @@ impl App {
             if let Some(cache) = github::load_cache() {
                 github::apply(&mut projects, &cache);
             }
-            // Merged-ness is not computed here: it is the slow half, the
-            // handler carries last pass's answers across, and it starts a
-            // fresh pass as soon as this lands. Making the rows wait on it
-            // was the difference between a scan that draws in under a second
-            // and one that draws in ten.
+            compute_merged(&mut projects);
             let _ = tx.send(Msg::Scanned(projects));
         });
     }
@@ -632,20 +616,6 @@ impl App {
         self.loading = false;
         self.clamp();
         Ok(())
-    }
-
-    /// Recompute merged-ness for every row, off the UI thread.
-    ///
-    /// `git cherry` and the whole-branch patch-id behind it cost a few hundred
-    /// milliseconds over every row, so this answers with pairs rather than a
-    /// tree -- see `Msg::Merged`.
-    pub fn start_merged_pass(&mut self) {
-        let rows = merged_rows(&self.projects);
-        let tx = self.tx.clone();
-        self.merging = true;
-        std::thread::spawn(move || {
-            let _ = tx.send(Msg::Merged(merged_for(&rows)));
-        });
     }
 
     /// The branches this instance wants PR state for. Remote names, because
@@ -785,18 +755,11 @@ impl App {
                     // selection jumps and the failing list blinks out every 15s.
                     let selection = self.selection();
                     let failing = self.failing_by_pr();
-                    let merged = self.merged_by_branch();
 
                     self.projects = projects;
                     self.scanning = false;
                     self.loading = false;
                     self.restore_failing(&failing);
-                    // A scan knows nothing about merged-ness -- `discover` sets
-                    // every row to `No` -- so without this the dashboard forgets
-                    // which branches have landed every 15 seconds and only
-                    // remembers on the network minute. That is a `d` on a merged
-                    // branch reading "NOT merged into main".
-                    self.restore_merged(&merged);
                     // An explicit request wins over carrying the old selection
                     // forward; on the first scan there is no old one anyway.
                     match pending {
@@ -822,10 +785,8 @@ impl App {
                     if first && self.daemon.is_none() {
                         self.start_refresh();
                     }
-                    // The scan may have moved a branch's HEAD, and the carried
-                    // answer is only last scan's. This one is local git, so it
-                    // does not wait for the network.
-                    self.start_merged_pass();
+                    crate::cache::save(&self.projects);
+                    self.sync_herdr();
                 }
                 // `a` means "hold the numbers still in this window", and with a
                 // daemon the numbers arrive unbidden -- it is still fetching for
@@ -839,26 +800,11 @@ impl App {
                     github::apply(&mut self.projects, &cache);
                     self.reviews = github::to_reviews(&cache);
                     self.link_reviews();
-                    self.start_merged_pass();
-                }
-                Msg::Merged(pairs) => {
-                    self.merging = false;
-                    for (rb, m) in pairs {
-                        for p in &mut self.projects {
-                            for w in &mut p.workstreams {
-                                if w.repo == rb.repo && w.git.branch == rb.branch {
-                                    w.merged = m;
-                                }
-                            }
-                        }
-                    }
-                    // The snapshot waits for this so the next launch draws
-                    // merged rows as merged, not as `No` until its own pass.
-                    crate::cache::save(&self.projects);
+                    compute_merged(&mut self.projects);
+                    self.sync_herdr();
                 }
                 Msg::RefreshFailed(e) => {
                     self.refreshing = false;
-                    self.merging = false;
                     self.error = Some(e);
                 }
                 Msg::Reviewers(logins) => {
@@ -969,6 +915,19 @@ impl App {
         self.reviews.get(self.review_idx)
     }
 
+    /// Mirror the tree into herdr's sidebar, off the UI thread.
+    /// Skipped mid-scan: the tree may still be last run's snapshot, which lacks
+    /// the repos placement needs, and the scan syncs when it lands.
+    fn sync_herdr(&self) {
+        if cfg!(test) || self.scanning || !crate::herdr::available() {
+            return;
+        }
+        let (projects, reviews) = (self.projects.clone(), self.reviews.clone());
+        std::thread::spawn(move || {
+            let _ = crate::herdr::sync(&projects, &reviews);
+        });
+    }
+
     /// Pair each review with the worktree it is checked out in, if any.
     ///
     /// The two lists meet only here. A review comes from GitHub and a worktree
@@ -1054,53 +1013,17 @@ impl App {
     }
 }
 
-/// A row as the merged-ness pass needs it: which branch, where, and whether
-/// its PR says merged.
-pub type MergedRow = (RepoBranch, Option<PathBuf>, bool);
-
-fn merged_rows(projects: &[Project]) -> Vec<MergedRow> {
-    projects
-        .iter()
-        .flat_map(|p| p.workstreams.iter())
-        .map(|w| {
-            (
-                RepoBranch {
-                    repo: w.repo.clone(),
-                    branch: w.git.branch.clone(),
-                },
-                w.path.clone(),
-                w.pr.as_ref().is_some_and(|pr| pr.state == PrState::Merged),
-            )
-        })
-        .collect()
-}
-
-/// Merged-ness for a set of rows, each against its own repo's base.
-pub fn merged_for(rows: &[MergedRow]) -> Vec<(RepoBranch, Merged)> {
-    let mut repos: Vec<&str> = rows.iter().map(|(rb, _, _)| rb.repo.as_str()).collect();
-    repos.sort();
-    repos.dedup();
-    let bases: std::collections::HashMap<&str, String> =
-        git::par_map(repos, |r| (r, git::base_ref(&repo::path(r))))
-            .into_iter()
-            .collect();
-    git::par_map(rows.iter().collect(), |(rb, path, pr_merged)| {
-        let dir = path.clone().unwrap_or_else(|| repo::path(&rb.repo));
-        let base = &bases[rb.repo.as_str()];
-        (rb.clone(), git::merged(&dir, &rb.branch, base, *pr_merged))
-    })
-}
-
 /// Merged-ness for every row. Depends on the PR answer, so it must run *after*
-/// GitHub state is applied -- before it, every squash-merged branch reports open.
+/// GitHub state is applied.
 pub fn compute_merged(projects: &mut [Project]) {
-    let answers = merged_for(&merged_rows(projects));
-    for (w, (_, m)) in projects
-        .iter_mut()
-        .flat_map(|p| p.workstreams.iter_mut())
-        .zip(answers)
-    {
-        w.merged = m;
+    for w in projects.iter_mut().flat_map(|p| p.workstreams.iter_mut()) {
+        w.merged = if w.pr.as_ref().is_some_and(|pr| pr.state == PrState::Merged) {
+            Merged::Pr
+        } else if !w.git.head.is_empty() && w.git.ahead == 0 {
+            Merged::Ancestor
+        } else {
+            Merged::No
+        };
     }
 }
 
@@ -1195,28 +1118,6 @@ impl App {
                     .map(|f| ((r.clone(), pr.number), f))
             })
             .collect()
-    }
-
-    fn merged_by_branch(&self) -> Vec<((String, String), Merged)> {
-        self.projects
-            .iter()
-            .flat_map(|p| p.workstreams.iter())
-            .filter(|w| w.merged.is_merged())
-            .map(|w| ((w.repo.clone(), w.git.branch.clone()), w.merged))
-            .collect()
-    }
-
-    fn restore_merged(&mut self, merged: &[((String, String), Merged)]) {
-        for p in &mut self.projects {
-            for w in &mut p.workstreams {
-                if let Some((_, m)) = merged
-                    .iter()
-                    .find(|((r, b), _)| *r == w.repo && *b == w.git.branch)
-                {
-                    w.merged = *m;
-                }
-            }
-        }
     }
 
     fn restore_failing(&mut self, failing: &[((String, u32), Vec<Check>)]) {
@@ -1396,7 +1297,7 @@ mod tests {
     use super::*;
     use crate::model::{ProjectKind, Workstream};
 
-    fn tree(branch: &str, merged: Merged) -> Vec<Project> {
+    fn tree(ahead: u32, pr: Option<PrState>) -> Vec<Project> {
         vec![Project {
             slug: "backup-restore".into(),
             emoji: "\u{1f510}".into(),
@@ -1413,42 +1314,35 @@ mod tests {
                 repo: "vxsuite".into(),
                 path: Some(PathBuf::from("/tmp/w")),
                 git: crate::model::GitState {
-                    branch: branch.into(),
+                    branch: "brian/feat/admin/restore-mode".into(),
+                    head: "abc1234".into(),
+                    ahead,
                     ..Default::default()
                 },
-                merged,
-                pr: None,
+                merged: Merged::No,
+                pr: pr.map(|state| crate::model::PrInfo {
+                    state,
+                    ..Default::default()
+                }),
             }],
         }]
     }
 
-    /// A scan starts every row at `No`, so what it does not know has to be
-    /// carried over the tree it replaces -- or `d` on a merged branch reads
-    /// "NOT merged into main" for the rest of the minute.
-    #[test]
-    fn a_rescan_does_not_forget_which_branches_have_landed() {
-        let mut app = App::new().expect("app");
-        app.projects = tree("brian/feat/admin/restore-mode", Merged::Pr);
-
-        let carried = app.merged_by_branch();
-        app.projects = tree("brian/feat/admin/restore-mode", Merged::No);
-        app.restore_merged(&carried);
-
-        assert_eq!(app.projects[0].workstreams[0].merged, Merged::Pr);
+    fn merged(ahead: u32, pr: Option<PrState>) -> Merged {
+        let mut projects = tree(ahead, pr);
+        compute_merged(&mut projects);
+        projects[0].workstreams[0].merged
     }
 
-    /// Only merged-ness is carried. An unmerged row that the scan re-read is
-    /// the scan's answer, not a stale one held over.
     #[test]
-    fn nothing_carries_a_branch_back_to_unmerged() {
-        let mut app = App::new().expect("app");
-        app.projects = tree("brian/feat/admin/restore-mode", Merged::No);
+    fn a_merged_pr_vouches_for_the_branch_whatever_it_is_ahead_by() {
+        assert_eq!(merged(3, Some(PrState::Merged)), Merged::Pr);
+        assert_eq!(merged(3, Some(PrState::Open)), Merged::No);
+        assert_eq!(merged(3, None), Merged::No);
+    }
 
-        let carried = app.merged_by_branch();
-        assert!(carried.is_empty());
-
-        app.projects = tree("brian/feat/admin/restore-mode", Merged::Equivalent);
-        app.restore_merged(&carried);
-        assert_eq!(app.projects[0].workstreams[0].merged, Merged::Equivalent);
+    #[test]
+    fn a_branch_main_already_contains_is_merged_without_a_pr() {
+        assert_eq!(merged(0, None), Merged::Ancestor);
     }
 }

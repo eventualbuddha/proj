@@ -77,23 +77,16 @@ pub struct GitState {
     pub op: Option<Op>,
 }
 
-/// Merged-ness is three separate questions and conflating them is how a tool
-/// starts lying. A squash-merged branch is not an ancestor of `main`, so
-/// ancestry alone reports every merged branch as unmerged -- and squash is the
-/// common case in this repo.
+/// Whether a branch has landed: GitHub says its PR merged, or main already
+/// contains its tip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum Merged {
     #[default]
     No,
-    /// The PR is marked merged on GitHub. The most trustworthy signal.
     Pr,
-    /// The branch tip is reachable from the base. A real merge commit or a
-    /// fast-forward.
+    /// A real merge commit or a fast-forward.
     Ancestor,
-    /// Every commit has an equivalent patch-id on the base, though the history
-    /// was rewritten. This is what a squash merge looks like from here.
-    Equivalent,
 }
 
 impl Merged {
@@ -106,9 +99,6 @@ impl Merged {
             Merged::No => "",
             Merged::Pr => "merged",
             Merged::Ancestor => "merged",
-            // Worth distinguishing in the UI: it means "the code is in main"
-            // rather than "GitHub says so", which is a weaker claim.
-            Merged::Equivalent => "squashed",
         }
     }
 }

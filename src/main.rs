@@ -5,6 +5,7 @@ mod daemon;
 mod discover;
 mod git;
 mod github;
+mod herdr;
 mod ipc;
 mod link;
 mod model;
@@ -21,7 +22,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use std::io::stdout;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use app::{App, Confirm, CopyMenu, Pane, Select};
@@ -47,6 +48,10 @@ fn main() -> Result<()> {
         println!(
             "  proj --stranded DIR  print DIR's commits that are in neither main nor a remote"
         );
+        println!("  proj --herdr-sync    label, annotate and order herdr workspaces by project");
+        println!(
+            "  proj --herdr-open DIR  focus the herdr workspace at DIR, creating it if needed"
+        );
         return Ok(());
     }
 
@@ -64,14 +69,37 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // `proj rm` asks this before it removes anything. It is the same answer the
-    // delete confirmation shows, from the same code.
+    // `proj rm` asks this before it removes anything. A merged PR vouches for
+    // the whole branch.
     if let Some(i) = args.iter().position(|a| a == "--stranded") {
         let dir = PathBuf::from(args.get(i + 1).context("--stranded needs a directory")?);
+        let dir = dir.canonicalize().unwrap_or(dir);
+        let mut projects = discover::scan_only(&|p| p.canonicalize().is_ok_and(|p| p == dir))?;
+        if let Some(cache) = github::load_cache() {
+            github::apply(&mut projects, &cache);
+        }
+        let pr_merged = projects
+            .iter()
+            .flat_map(|p| &p.workstreams)
+            .filter_map(|w| w.pr.as_ref())
+            .any(|pr| pr.state == model::PrState::Merged);
+        if pr_merged {
+            return Ok(());
+        }
         for sha in git::stranded(&dir, &git::base_ref(&dir)) {
             println!("{sha}");
         }
         return Ok(());
+    }
+
+    if args.iter().any(|a| a == "--herdr-sync") {
+        let app = herdr_app(None)?;
+        return herdr::sync(&app.projects, &app.reviews);
+    }
+    if let Some(i) = args.iter().position(|a| a == "--herdr-open") {
+        let dir = PathBuf::from(args.get(i + 1).context("--herdr-open needs a directory")?);
+        let app = herdr_app(Some(&dir))?;
+        return herdr::open(&app.projects, &app.reviews, &dir);
     }
 
     let cd_file = args
@@ -123,13 +151,9 @@ fn main() -> Result<()> {
             }
         }
 
-        // And for the merged-ness pass behind the scan. A dashboard that has
-        // scanned is not yet one that can answer `d`: pressing it while the
-        // pass is still running drew "NOT merged into main" over a merged
-        // branch, since a fresh scan starts every row at `No`.
         if waiting {
             let deadline = std::time::Instant::now() + Duration::from_secs(60);
-            while (app.scanning || app.merging) && std::time::Instant::now() < deadline {
+            while app.scanning && std::time::Instant::now() < deadline {
                 app.drain();
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -1182,6 +1206,23 @@ fn truncate_title(title: &str) -> String {
     format!("{}…", title.chars().take(57).collect::<String>())
 }
 
+/// A scan plus the cached GitHub state, with no network and no daemon.
+/// An `App` that has scanned only the worktrees open in herdr, plus `extra`.
+fn herdr_app(extra: Option<&Path>) -> Result<App> {
+    std::env::set_var("PROJ_NO_DAEMON", "1");
+    let cwds = herdr::cwds()?;
+    let mut app = App::new()?;
+    app.projects = discover::scan_only(&|p| {
+        extra.is_some_and(|e| e.starts_with(p)) || cwds.iter().any(|c| c.starts_with(p))
+    })?;
+    if let Some(cache) = github::load_cache() {
+        github::apply(&mut app.projects, &cache);
+        app.reviews = github::to_reviews(&cache);
+        app.link_reviews();
+    }
+    Ok(app)
+}
+
 fn dump(no_gh: bool) -> Result<()> {
     // A one-shot that fetches for itself below, so there is nothing for a daemon
     // to do here but start up and outlive the command that started it.
@@ -1654,7 +1695,10 @@ mod new_project_tests {
         a.projects = vec![project("react-19", vec![ws(Some("/tmp/react-19/hooks"))])];
         handle_key(&mut a, key('A'));
         let c = a.confirm.as_ref().expect("a confirmation");
-        assert!(c.body.iter().any(|l| l.contains("1 worktree(s) move with it")));
+        assert!(c
+            .body
+            .iter()
+            .any(|l| l.contains("1 worktree(s) move with it")));
         assert!(!c.body.iter().any(|l| l.contains("unfiled")));
     }
 }

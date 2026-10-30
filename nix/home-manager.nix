@@ -35,6 +35,15 @@ in
       description = "The `proj-prompt` script starship runs on every prompt.";
     };
 
+    herdr.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Install the herdr plugin manifest at ~/.config/proj/herdr-plugin. Register
+        it once with `herdr plugin link ~/.config/proj/herdr-plugin`.
+      '';
+    };
+
     starship.enable = lib.mkOption {
       type = lib.types.bool;
       default = config.programs.starship.enable;
@@ -65,6 +74,27 @@ in
       # setup; see the file for why it is driven off PWD rather than `proj cd`.
       "fish/conf.d/30-proj-cargo.fish".source = ../fish/conf.d/30-proj-cargo.fish;
     };
+
+    # A copy, not a home-manager symlink: herdr records the resolved manifest
+    # path when linking, so a store symlink would pin it to this generation.
+    # Store paths in the commands keep the hooks independent of herdr's PATH.
+    home.activation.projHerdrPlugin = lib.mkIf cfg.herdr.enable (
+      let
+        manifest = pkgs.writeText "herdr-plugin.toml" (
+          builtins.replaceStrings [ ''"proj-tui"'' ] [ ''"${cfg.package}/bin/proj-tui"'' ] (
+            builtins.readFile ../herdr/herdr-plugin.toml
+          )
+        );
+      in
+      # Replaced by rename, since herdr watches it and reloads on every change.
+      lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+        dest="${config.xdg.configHome}/proj/herdr-plugin/herdr-plugin.toml"
+        if ! cmp -s ${manifest} "$dest"; then
+          run install -Dm644 ${manifest} "$dest.tmp"
+          run mv -f "$dest.tmp" "$dest"
+        fi
+      ''
+    );
 
     programs.starship.settings = lib.mkIf cfg.starship.enable {
       custom.proj = {
