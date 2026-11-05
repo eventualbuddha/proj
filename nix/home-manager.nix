@@ -69,10 +69,6 @@ in
       # travel together.
       "fish/functions/proj.fish".source = ../fish/proj.fish;
       "fish/completions/proj.fish".source = ../fish/completions/proj.fish;
-
-      # Per-project CARGO_TARGET_DIR. Numbered to load after the toolchain
-      # setup; see the file for why it is driven off PWD rather than `proj cd`.
-      "fish/conf.d/30-proj-cargo.fish".source = ../fish/conf.d/30-proj-cargo.fish;
     };
 
     # A copy, not a home-manager symlink: herdr records the resolved manifest

@@ -19,7 +19,6 @@ from that clone's `origin`.
 | `src/` | `proj-tui`, the dashboard (Rust, ratatui). Shells out to `git` and `gh`. |
 | `fish/proj.fish` | The `proj` command. Bare `proj` opens the dashboard. |
 | `fish/completions/proj.fish` | Completions, fed by `proj __projects` / `__workstreams` / `__branches`. |
-| `fish/conf.d/30-proj-cargo.fish` | Per-project `CARGO_TARGET_DIR`, driven off `PWD`. |
 | `bin/proj-prompt.sh` | The starship segment, as a plain `sh` script. |
 | `herdr/herdr-plugin.toml` | The herdr plugin: labels, annotates and orders workspaces by project, and opens the dashboard as a popup. |
 
