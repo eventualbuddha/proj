@@ -700,7 +700,10 @@ function __proj_worktree_add --description "Add the worktree at PATH from the cl
 
     # `--reflink=always` fails rather than falling back to a full copy of every
     # node_modules and build output; a plain checkout is cheaper than that.
+    # Turbo keeps one cache for every worktree, in the canonical clone's
+    # `.turbo`, so a copy of it would only be dead weight.
     set -l entries (string match -v -- "$repo/.git" $repo/* $repo/.*)
+    set entries (string match -v -- "$repo/.turbo" $entries)
     if not cp -a --reflink=always $entries "$wt_path/" 2>/dev/null
         echo "proj: cannot reflink $repo, checking out instead" >&2
         rm -rf (string match -v -- "$wt_path/.git" $wt_path/* $wt_path/.*)
