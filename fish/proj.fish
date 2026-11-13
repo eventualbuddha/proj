@@ -1072,7 +1072,8 @@ function __proj_remove
     set -l entry ""
     if test -n "$target"
         set entry (__proj_find "$target")
-        or return 1
+        # 2 is ambiguous, and `__proj_find` has already listed the matches.
+        test $status -eq 2; and return 1
         if test -z "$entry"
             echo "proj rm: no workstream matching '$target'" >&2
             return 1
