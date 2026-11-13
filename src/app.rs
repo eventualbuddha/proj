@@ -45,6 +45,9 @@ pub enum Msg {
     /// The daemon started or finished a fetch. The spinner belongs to whoever
     /// is doing the work, and once there is a daemon that is not us.
     Fetching(bool),
+    /// A background command finished: its label, whether it succeeded, and its
+    /// combined output.
+    Ran(String, bool, String),
 }
 
 /// Where to open, and whether that request is strong enough to move focus.
@@ -501,6 +504,12 @@ pub struct App {
     /// terminal where you can read it and interrupt it. Running that inside the
     /// TUI would mean a log pane reimplementing what the shell already does.
     pub action: Option<String>,
+    /// A command running in the background, by label, while a spinner shows.
+    pub running: Option<String>,
+    /// A background command that failed: its label and output.
+    pub failed: Option<(String, String)>,
+    /// Scan again once the in-flight one lands, since it predates a change.
+    pub rescan_pending: bool,
 }
 
 impl App {
@@ -545,6 +554,9 @@ impl App {
             daemon: None,
             sent_branches: Default::default(),
             action: None,
+            running: None,
+            failed: None,
+            rescan_pending: false,
         };
         // Draw last run's state immediately; the scan replaces it when it lands.
         if let Some(projects) = crate::cache::load() {
@@ -759,6 +771,9 @@ impl App {
                     self.projects = projects;
                     self.scanning = false;
                     self.loading = false;
+                    if std::mem::take(&mut self.rescan_pending) {
+                        self.start_scan(false);
+                    }
                     self.restore_failing(&failing);
                     // An explicit request wins over carrying the old selection
                     // forward; on the first scan there is no old one anyway.
@@ -839,6 +854,17 @@ impl App {
                     if on {
                         self.network_at = github::now();
                     }
+                }
+                Msg::Ran(label, ok, output) => {
+                    self.running = None;
+                    if ok {
+                        self.flash(format!("{label}: done"));
+                    } else if output.trim().is_empty() {
+                        self.failed = Some((label, "failed without saying why".into()));
+                    } else {
+                        self.failed = Some((label, output));
+                    }
+                    self.rescan();
                 }
                 Msg::Contexts(repo, number, list) => {
                     self.contexts_inflight.remove(&(repo.clone(), number));
@@ -1251,6 +1277,53 @@ impl App {
         } else {
             true
         }
+    }
+
+    /// Scan now, or as soon as the in-flight scan lands.
+    pub fn rescan(&mut self) {
+        if self.scanning {
+            self.rescan_pending = true;
+        } else {
+            self.start_scan(false);
+        }
+    }
+
+    /// Run `proj ARGS...` in fish off the UI thread, buffering its output.
+    pub fn run_quiet(&mut self, label: String, args: Vec<String>) {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        self.running = Some(label.clone());
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let mut cmd = Command::new("fish");
+            cmd.args(["-c", "proj $argv 2>&1"])
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .env("GIT_TERMINAL_PROMPT", "0");
+            // Without a controlling terminal, ssh and git fail rather than prompt
+            // over the TUI.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+            let (ok, output) = match cmd.output() {
+                Ok(o) => (
+                    o.status.success(),
+                    format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&o.stdout),
+                        String::from_utf8_lossy(&o.stderr)
+                    ),
+                ),
+                Err(e) => (false, format!("could not run fish: {e}")),
+            };
+            let _ = tx.send(Msg::Ran(label, ok, output));
+        });
     }
 
     pub fn flash(&mut self, msg: impl Into<String>) {

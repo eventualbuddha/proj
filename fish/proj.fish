@@ -68,6 +68,10 @@ function proj --description "Manage project worktrees under ~/projects"
         case __branches
             __proj_complete_branches $argv
 
+            # The dashboard's delete for a branch with no worktree
+        case __delete-branch
+            __proj_delete_branch $argv
+
         case '*'
             echo "proj: unknown command '$cmd'" >&2
             return 1
@@ -134,6 +138,16 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
         if not test -s "$file"
             # No verb: the user quit.
             rm -f "$file"
+            # The dashboard may have deleted the worktree we are standing in.
+            if not test -d "$PWD"
+                set -l root (__proj_root)
+                set -l project (string split -m1 / -- (string replace -- "$root/" "" "$PWD"))[1]
+                if test -d "$root/$project"
+                    cd "$root/$project"
+                else
+                    cd "$root"
+                end
+            end
             return $st
         end
 
@@ -262,15 +276,6 @@ function __proj_run_tui --description "Run the dashboard, act on what it asks fo
             case review-update
                 __proj_review_update "$parts[2]" "$parts[3]"
                 return $status
-
-            case delete
-                __proj_remove "$parts[2]"
-                # The row is gone, so reopening on it would land nowhere.
-                set reopen
-
-            case delete-branch
-                __proj_delete_branch "$parts[3]" "$parts[4]" "$parts[5]"
-                set reopen
 
             case '*'
                 echo "proj: the dashboard asked for something unknown: $parts[1]" >&2

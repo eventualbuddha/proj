@@ -362,6 +362,14 @@ fn run(term: &mut Terminal, app: &mut App) -> Result<()> {
 /// needs a real tty, this does not, and every key-handling bug so far has been
 /// in code that only a tty could reach.
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+    if app.running.is_some() {
+        return key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+    }
+    if app.failed.is_some() {
+        app.failed = None;
+        return false;
+    }
+
     if app.filtering {
         match key.code {
             KeyCode::Esc => {
@@ -473,7 +481,12 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let verb = c.verb.clone();
+                let label = c.title.trim().to_string();
                 app.confirm = None;
+                if let Some(args) = quiet_args(&verb) {
+                    app.run_quiet(label, args);
+                    return false;
+                }
                 app.action = Some(verb);
                 return true;
             }
@@ -609,6 +622,9 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
 /// cannot drift apart, and through the widgets' own `offset()`, so it stays
 /// right once a list is long enough to scroll.
 fn handle_mouse(app: &mut App, m: MouseEvent, area: ratatui::layout::Rect) -> bool {
+    if app.running.is_some() || app.failed.is_some() {
+        return false;
+    }
     let r = ui::regions(area);
     let (x, y) = (m.column, m.row);
     let inside = |rect: ratatui::layout::Rect| {
@@ -889,6 +905,18 @@ fn copy_selected(app: &mut App) {
 /// that conflicts, a push that is rejected, a build that fails. The wrapper
 /// reopens the dashboard afterwards, so this is a round trip rather than an
 /// exit.
+/// The `proj` arguments for a verb that runs inside the TUI rather than in the
+/// wrapper, if it is one.
+fn quiet_args(verb: &str) -> Option<Vec<String>> {
+    let parts: Vec<&str> = verb.split('\t').collect();
+    let args: &[&str] = match parts.as_slice() {
+        ["delete", target] => &["rm", target],
+        ["delete-branch", _, branch, remote, repo] => &["__delete-branch", branch, remote, repo],
+        _ => return None,
+    };
+    Some(args.iter().map(|s| s.to_string()).collect())
+}
+
 fn emit(app: &mut App, verb: String) -> bool {
     app.action = Some(verb);
     true
@@ -1058,8 +1086,7 @@ fn confirm_archive(app: &mut App) {
 ///
 /// `proj rm` refuses on uncommitted work or on commits that exist nowhere else,
 /// so this is not the safety net -- it is the part that tells you *which*
-/// workstream you are about to remove, before the shell scrolls past with an
-/// answer.
+/// workstream you are about to remove.
 fn confirm_delete(app: &mut App) {
     if app.sidebar == app::Sidebar::Reviews {
         return confirm_delete_review(app);
@@ -1335,6 +1362,31 @@ mod tests {
         assert!(!handle_key(&mut a, esc()));
         assert!(a.confirm.is_none());
         assert!(a.action.is_none(), "cancelling must not emit the verb");
+    }
+
+    #[test]
+    fn confirming_a_delete_runs_it_in_place() {
+        let mut a = app();
+        a.confirm = Some(app::Confirm {
+            title: " delete p/w ".into(),
+            body: vec![],
+            verb: "delete\tp/w".into(),
+            yes: "delete",
+        });
+        assert!(!handle_key(&mut a, key('y')));
+        assert!(a.action.is_none());
+        assert_eq!(a.running.as_deref(), Some("delete p/w"));
+        assert!(!handle_key(&mut a, key('q')), "q must wait for the delete");
+    }
+
+    #[test]
+    fn only_deletes_run_in_place() {
+        assert_eq!(quiet_args("delete\tp/w").unwrap(), ["rm", "p/w"]);
+        assert_eq!(
+            quiet_args("delete-branch\tp/w\tb\torigin-b\to/r").unwrap(),
+            ["__delete-branch", "b", "origin-b", "o/r"]
+        );
+        assert!(quiet_args("archive\tp").is_none());
     }
 
     #[test]

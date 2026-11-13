@@ -131,6 +131,41 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             44,
             7,
         );
+    } else if let Some(label) = &app.running {
+        draw_modal(
+            f,
+            &format!(" {label} "),
+            vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(spinner(), Style::default().fg(ACCENT)),
+                    Span::styled("  working", Style::default().bold()),
+                ]),
+            ],
+            64,
+            4,
+        );
+    } else if let Some((label, output)) = &app.failed {
+        let area = f.area();
+        let max = area.height.saturating_sub(6) as usize;
+        let lines: Vec<&str> = output.trim_end().lines().collect();
+        let shown = &lines[lines.len().saturating_sub(max)..];
+        let mut text = vec![Line::from("")];
+        text.extend(
+            shown
+                .iter()
+                .map(|l| Line::from(Span::styled(format!(" {l}"), Style::default().fg(DIM)))),
+        );
+        text.push(Line::from(""));
+        text.push(Line::from(Span::styled(" any key to dismiss", Style::default().bold())));
+        let h = text.len() as u16 + 2;
+        draw_modal_left(
+            f,
+            &format!(" {label} failed "),
+            text,
+            area.width.saturating_sub(4).min(110),
+            h,
+        );
     } else if let Some(n) = &app.new_ws {
         let mut text = vec![Line::from("")];
         // The name stays on screen while the base is being picked: it is what
